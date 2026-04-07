@@ -208,12 +208,10 @@ fn resolve_default_branch(root: &Path) -> Result<Option<String>> {
     if let Ok(symbolic_ref) = run_git(
         root,
         ["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"].as_slice(),
-    ) {
-        if let Some(branch) = symbolic_ref.trim().rsplit('/').next()
-            && local_branch_exists(root, branch)?
-        {
-            return Ok(Some(branch.to_string()));
-        }
+    ) && let Some(branch) = symbolic_ref.trim().rsplit('/').next()
+        && local_branch_exists(root, branch)?
+    {
+        return Ok(Some(branch.to_string()));
     }
 
     for fallback in ["main", "master"] {
