@@ -4,6 +4,7 @@ mod clipboard;
 mod export;
 mod git;
 mod model;
+mod updater;
 
 fn main() {
     if let Err(err) = cli::run() {
