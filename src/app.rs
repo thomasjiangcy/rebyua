@@ -1115,8 +1115,7 @@ impl App {
             .map(ReviewEdge::label)
             .unwrap_or_default();
         let progress = format!("Stack {}/{}", self.current_edge_idx + 1, stack.edges.len());
-        let leaf = format!("Leaf {}", stack.leaf_branch);
-        let reserved = progress.chars().count() + leaf.chars().count() + 4;
+        let reserved = progress.chars().count() + 2;
         let edge_width = (area.width as usize).saturating_sub(reserved).max(12);
         let edge_label = truncate_middle(&current_edge, edge_width);
         frame.render_widget(
@@ -1129,8 +1128,6 @@ impl App {
                         .fg(Color::Rgb(231, 193, 119))
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::raw("  "),
-                Span::styled(leaf, Style::default().fg(Color::Rgb(133, 146, 178))),
             ])),
             area,
         );
