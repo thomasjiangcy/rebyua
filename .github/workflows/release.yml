@@ -24,9 +24,9 @@ jobs:
         include:
           - os: ubuntu-latest
             platform: linux-x86_64
-          - os: macos-13
+          - os: macos-15-intel
             platform: macos-x86_64
-          - os: macos-14
+          - os: macos-15
             platform: macos-aarch64
 
     steps:
@@ -43,7 +43,7 @@ jobs:
         run: cargo test --locked
 
       - name: Build release binary
-        run: cargo build --locked --release --bin rba
+        run: cargo build --locked --release --bin reb
 
       - name: Package archive
         shell: bash
