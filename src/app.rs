@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -32,6 +33,9 @@ const NOTIFICATION_TTL: Duration = Duration::from_secs(3);
 const COMMENT_BOX_HEIGHT: u16 = 5;
 const FOOTER_HEIGHT: u16 = 1;
 const TWO_ROW_BREAKPOINT: u16 = 100;
+const PATCH_CACHE_LIMIT: usize = 16;
+const WHOLE_FILE_CACHE_LIMIT: usize = 2;
+const WHOLE_FILE_HIGHLIGHT_LINE_LIMIT: usize = 512;
 
 pub fn run(args: ReviewArgs) -> Result<()> {
     let repo = GitRepo::discover(&args)?;
@@ -110,6 +114,7 @@ struct WholeFileLine {
 #[derive(Debug, Clone)]
 struct WholeFileHighlightCache {
     lines: HashMap<usize, Vec<StyledSegment>>,
+    line_order: VecDeque<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -177,7 +182,9 @@ struct App {
     focus: Focus,
     view_mode: DiffViewMode,
     patch_cache: HashMap<String, HighlightedPatch>,
+    patch_cache_order: VecDeque<String>,
     whole_file_cache: HashMap<String, WholeFileRender>,
+    whole_file_cache_order: VecDeque<String>,
     whole_file_highlight_cache: HashMap<String, WholeFileHighlightCache>,
     diff_cursor: usize,
     diff_scroll: usize,
@@ -219,7 +226,9 @@ impl App {
             focus: Focus::Files,
             view_mode: DiffViewMode::Patch,
             patch_cache: HashMap::new(),
+            patch_cache_order: VecDeque::new(),
             whole_file_cache: HashMap::new(),
+            whole_file_cache_order: VecDeque::new(),
             whole_file_highlight_cache: HashMap::new(),
             diff_cursor: 0,
             diff_scroll: 0,
@@ -1555,12 +1564,13 @@ impl App {
             return;
         };
         if self.patch_cache.contains_key(&summary.path) {
+            self.touch_patch_cache_key(&summary.path);
             return;
         }
         match self.repo.load_patch(&summary) {
             Ok(patch) => {
                 let highlighted = self.highlight_patch(patch);
-                self.patch_cache.insert(summary.path.clone(), highlighted);
+                self.insert_patch_cache(summary.path.clone(), highlighted);
             }
             Err(err) => {
                 let fallback = FilePatch {
@@ -1569,7 +1579,7 @@ impl App {
                     metadata: vec![format!("Failed to load patch: {err}")],
                 };
                 let highlighted = self.highlight_patch(fallback);
-                self.patch_cache.insert(summary.path.clone(), highlighted);
+                self.insert_patch_cache(summary.path.clone(), highlighted);
                 self.set_notification(
                     format!("Failed to load {}: {err}", summary.path),
                     NotificationKind::Error,
@@ -1583,6 +1593,7 @@ impl App {
             return false;
         };
         if self.whole_file_cache.contains_key(&summary.path) {
+            self.touch_whole_file_cache_key(&summary.path);
             return true;
         }
         let Some(patch) = self.current_patch() else {
@@ -1592,13 +1603,7 @@ impl App {
         match self.repo.load_file_text(&summary) {
             Ok(Some(text)) => {
                 let whole = self.build_whole_file_render(patch, &text);
-                self.whole_file_cache.insert(summary.path.clone(), whole);
-                self.whole_file_highlight_cache.insert(
-                    summary.path.clone(),
-                    WholeFileHighlightCache {
-                        lines: HashMap::new(),
-                    },
-                );
+                self.insert_whole_file_cache(summary.path.clone(), whole);
                 true
             }
             Ok(None) => false,
@@ -2162,10 +2167,57 @@ impl App {
         let segments = highlight_line_segments(&self.syntax_set, &mut highlighter, &line.text);
 
         if let Some(cache) = self.whole_file_highlight_cache.get_mut(&path) {
+            if !cache.lines.contains_key(&line_idx) {
+                cache.line_order.retain(|cached_idx| *cached_idx != line_idx);
+                cache.line_order.push_back(line_idx);
+            }
             cache.lines.insert(line_idx, segments.clone());
+            while cache.line_order.len() > WHOLE_FILE_HIGHLIGHT_LINE_LIMIT {
+                if let Some(evicted) = cache.line_order.pop_front() {
+                    cache.lines.remove(&evicted);
+                }
+            }
         }
 
         segments
+    }
+
+    fn insert_patch_cache(&mut self, path: String, patch: HighlightedPatch) {
+        self.patch_cache.insert(path.clone(), patch);
+        self.touch_patch_cache_key(&path);
+        while self.patch_cache.len() > PATCH_CACHE_LIMIT {
+            if let Some(evicted) = self.patch_cache_order.pop_front() {
+                self.patch_cache.remove(&evicted);
+            }
+        }
+    }
+
+    fn touch_patch_cache_key(&mut self, path: &str) {
+        self.patch_cache_order.retain(|cached| cached != path);
+        self.patch_cache_order.push_back(path.to_string());
+    }
+
+    fn insert_whole_file_cache(&mut self, path: String, whole: WholeFileRender) {
+        self.whole_file_cache.insert(path.clone(), whole);
+        self.whole_file_highlight_cache.insert(
+            path.clone(),
+            WholeFileHighlightCache {
+                lines: HashMap::new(),
+                line_order: VecDeque::new(),
+            },
+        );
+        self.touch_whole_file_cache_key(&path);
+        while self.whole_file_cache.len() > WHOLE_FILE_CACHE_LIMIT {
+            if let Some(evicted) = self.whole_file_cache_order.pop_front() {
+                self.whole_file_cache.remove(&evicted);
+                self.whole_file_highlight_cache.remove(&evicted);
+            }
+        }
+    }
+
+    fn touch_whole_file_cache_key(&mut self, path: &str) {
+        self.whole_file_cache_order.retain(|cached| cached != path);
+        self.whole_file_cache_order.push_back(path.to_string());
     }
 }
 
@@ -2518,7 +2570,9 @@ mod tests {
             focus: Focus::Diff,
             view_mode: DiffViewMode::Patch,
             patch_cache: HashMap::new(),
+            patch_cache_order: VecDeque::new(),
             whole_file_cache: HashMap::new(),
+            whole_file_cache_order: VecDeque::new(),
             whole_file_highlight_cache: HashMap::new(),
             diff_cursor: 0,
             diff_scroll: 0,
@@ -2547,7 +2601,7 @@ mod tests {
             .expect("selected file should exist")
             .clone();
         let patch = app.highlight_patch(sample_patch(&summary));
-        app.patch_cache.insert(summary.path.clone(), patch);
+        app.insert_patch_cache(summary.path.clone(), patch);
     }
 
     fn key_char(ch: char) -> KeyEvent {
@@ -2967,6 +3021,59 @@ mod tests {
     }
 
     #[test]
+    fn patch_cache_is_bounded() {
+        let temp = TempDirGuard::new();
+        let files = (0..(PATCH_CACHE_LIMIT + 4))
+            .map(|idx| file_summary(&format!("src/{idx}.rs")))
+            .collect::<Vec<_>>();
+        let mut app = test_app(temp.path.clone(), files.clone());
+
+        for summary in &files {
+            let patch = app.highlight_patch(sample_patch(summary));
+            app.insert_patch_cache(summary.path.clone(), patch);
+        }
+
+        assert_eq!(app.patch_cache.len(), PATCH_CACHE_LIMIT);
+        assert!(!app.patch_cache.contains_key("src/0.rs"));
+        assert!(app
+            .patch_cache
+            .contains_key(&format!("src/{}.rs", PATCH_CACHE_LIMIT + 3)));
+    }
+
+    #[test]
+    fn whole_file_cache_is_bounded_with_highlight_cache() {
+        let temp = TempDirGuard::new();
+        let files = (0..(WHOLE_FILE_CACHE_LIMIT + 3))
+            .map(|idx| file_summary(&format!("src/{idx}.rs")))
+            .collect::<Vec<_>>();
+        let mut app = test_app(temp.path.clone(), files.clone());
+
+        for summary in &files {
+            app.insert_whole_file_cache(
+                summary.path.clone(),
+                WholeFileRender {
+                    lines: vec![WholeFileLine {
+                        old_lineno: Some(1),
+                        new_lineno: Some(1),
+                        text: "const value = 1;".to_string(),
+                        diff_kind: None,
+                        hunk_header: None,
+                    }],
+                    hunk_starts: vec![0],
+                },
+            );
+        }
+
+        assert_eq!(app.whole_file_cache.len(), WHOLE_FILE_CACHE_LIMIT);
+        assert_eq!(
+            app.whole_file_highlight_cache.len(),
+            WHOLE_FILE_CACHE_LIMIT
+        );
+        assert!(!app.whole_file_cache.contains_key("src/0.rs"));
+        assert!(!app.whole_file_highlight_cache.contains_key("src/0.rs"));
+    }
+
+    #[test]
     #[ignore = "profiling helper"]
     fn profile_whole_file_render_path() {
         let temp = TempDirGuard::new();
@@ -2993,14 +3100,7 @@ mod tests {
             })
             .collect();
         let hunk_starts = (0..line_count).step_by(200).collect();
-        app.whole_file_cache
-            .insert(summary.path.clone(), WholeFileRender { lines, hunk_starts });
-        app.whole_file_highlight_cache.insert(
-            summary.path.clone(),
-            WholeFileHighlightCache {
-                lines: HashMap::new(),
-            },
-        );
+        app.insert_whole_file_cache(summary.path.clone(), WholeFileRender { lines, hunk_starts });
 
         let mut terminal =
             Terminal::new(TestBackend::new(140, 40)).expect("test terminal should initialize");
@@ -3033,5 +3133,60 @@ mod tests {
         println!("whole-file top render(25x, {line_count} lines): {top_render_elapsed:?}");
         println!("whole-file deep render(25x, {line_count} lines): {deep_render_elapsed:?}");
         println!("ensure_cursor_visible(1000x): {cursor_elapsed:?}");
+    }
+
+    #[test]
+    #[ignore = "profiling helper"]
+    fn profile_cache_growth_across_many_files() {
+        let temp = TempDirGuard::new();
+        let file_count = 60usize;
+        let files: Vec<_> = (0..file_count)
+            .map(|idx| file_summary(&format!("src/file_{idx}.ts")))
+            .collect();
+        let mut app = test_app(temp.path.clone(), files.clone());
+
+        let line_count = 20_000usize;
+        let whole_lines: Vec<WholeFileLine> = (0..line_count)
+            .map(|idx| WholeFileLine {
+                old_lineno: Some(idx + 1),
+                new_lineno: Some(idx + 1),
+                text: format!("const value{idx} = value{idx} + 1;"),
+                diff_kind: if idx % 200 == 0 {
+                    Some(DiffKind::Add)
+                } else {
+                    None
+                },
+                hunk_header: if idx % 200 == 0 {
+                    Some(format!("@@ -{},1 +{},1 @@", idx + 1, idx + 1))
+                } else {
+                    None
+                },
+            })
+            .collect();
+        let hunk_starts = (0..line_count).step_by(200).collect::<Vec<_>>();
+
+        let start = Instant::now();
+        for summary in &files {
+            let patch = app.highlight_patch(sample_patch(summary));
+            app.insert_patch_cache(summary.path.clone(), patch);
+            app.insert_whole_file_cache(
+                summary.path.clone(),
+                WholeFileRender {
+                    lines: whole_lines.clone(),
+                    hunk_starts: hunk_starts.clone(),
+                },
+            );
+        }
+        let elapsed = start.elapsed();
+
+        println!("cached files: {}", files.len());
+        println!("lines per whole-file entry: {line_count}");
+        println!("patch cache size: {}", app.patch_cache.len());
+        println!("whole-file cache size: {}", app.whole_file_cache.len());
+        println!(
+            "whole-file highlight cache size: {}",
+            app.whole_file_highlight_cache.len()
+        );
+        println!("cache build elapsed: {elapsed:?}");
     }
 }
