@@ -154,6 +154,7 @@ struct App {
     files: Vec<FileSummary>,
     filtered_file_indices: Vec<usize>,
     selected_file_view_idx: usize,
+    file_list_scroll: usize,
     focus: Focus,
     view_mode: DiffViewMode,
     patch_cache: HashMap<String, HighlightedPatch>,
@@ -171,6 +172,7 @@ struct App {
     notification: Option<Notification>,
     pending_quit_confirmation: bool,
     should_quit: bool,
+    last_files_inner_height: u16,
     last_diff_inner_height: u16,
     syntax_set: SyntaxSet,
     syntax_theme: Theme,
@@ -192,6 +194,7 @@ impl App {
             files,
             filtered_file_indices: Vec::new(),
             selected_file_view_idx: 0,
+            file_list_scroll: 0,
             focus: Focus::Files,
             view_mode: DiffViewMode::Patch,
             patch_cache: HashMap::new(),
@@ -209,6 +212,7 @@ impl App {
             notification: None,
             pending_quit_confirmation: false,
             should_quit: false,
+            last_files_inner_height: 0,
             last_diff_inner_height: 0,
             syntax_set,
             syntax_theme,
@@ -772,7 +776,7 @@ impl App {
         self.render_footer(frame, root[1]);
     }
 
-    fn render_files(&self, frame: &mut Frame, area: Rect) {
+    fn render_files(&mut self, frame: &mut Frame, area: Rect) {
         let title = if let Some(filter_input) = &self.filter_input {
             format!(" Files /{} ", filter_input)
         } else if self.filter_query.is_empty() {
@@ -781,12 +785,22 @@ impl App {
             format!(" Files ({}) ", self.filter_query)
         };
 
+        self.last_files_inner_height = area.height.saturating_sub(2);
+        self.ensure_file_selection_visible();
+
+        let visible_rows = self.last_files_inner_height as usize;
+        let start_idx = self.file_list_scroll;
+        let end_idx = start_idx
+            .saturating_add(visible_rows)
+            .min(self.filtered_file_indices.len());
         let items: Vec<ListItem> = if self.filtered_file_indices.is_empty() {
             vec![ListItem::new(Line::from("No changed files"))]
         } else {
             self.filtered_file_indices
                 .iter()
                 .enumerate()
+                .skip(start_idx)
+                .take(end_idx.saturating_sub(start_idx))
                 .map(|(view_idx, file_idx)| {
                     let file = &self.files[*file_idx];
                     let counts = format!(
@@ -1272,6 +1286,7 @@ impl App {
 
         if self.filtered_file_indices.is_empty() {
             self.selected_file_view_idx = 0;
+            self.file_list_scroll = 0;
             self.diff_cursor = 0;
             self.diff_scroll = 0;
             self.selection = None;
@@ -1279,8 +1294,10 @@ impl App {
             self.expanded_comment_line = None;
         } else if self.selected_file_view_idx >= self.filtered_file_indices.len() {
             self.selected_file_view_idx = self.filtered_file_indices.len() - 1;
+            self.ensure_file_selection_visible();
             self.reset_diff_view_for_selected_file();
         } else {
+            self.ensure_file_selection_visible();
             self.load_selected_patch();
         }
     }
@@ -1679,6 +1696,27 @@ impl App {
     fn current_whole_file(&self) -> Option<&WholeFileRender> {
         self.selected_file_summary()
             .and_then(|summary| self.whole_file_cache.get(&summary.path))
+    }
+
+    fn ensure_file_selection_visible(&mut self) {
+        let total_items = self.filtered_file_indices.len();
+        let visible_rows = self.last_files_inner_height as usize;
+        if total_items == 0 || visible_rows == 0 {
+            self.file_list_scroll = 0;
+            return;
+        }
+
+        let max_scroll = total_items.saturating_sub(visible_rows);
+        self.file_list_scroll = self.file_list_scroll.min(max_scroll);
+
+        if self.selected_file_view_idx < self.file_list_scroll {
+            self.file_list_scroll = self.selected_file_view_idx;
+        } else if self.selected_file_view_idx >= self.file_list_scroll + visible_rows {
+            self.file_list_scroll = self
+                .selected_file_view_idx
+                .saturating_sub(visible_rows.saturating_sub(1))
+                .min(max_scroll);
+        }
     }
 
     fn whole_file_layout(&self) -> WholeFileLayout {
@@ -2240,6 +2278,7 @@ mod tests {
             files,
             filtered_file_indices: vec![0],
             selected_file_view_idx: 0,
+            file_list_scroll: 0,
             focus: Focus::Diff,
             view_mode: DiffViewMode::Patch,
             patch_cache: HashMap::new(),
@@ -2257,6 +2296,7 @@ mod tests {
             notification: None,
             pending_quit_confirmation: false,
             should_quit: false,
+            last_files_inner_height: 0,
             last_diff_inner_height: 20,
             syntax_set: SyntaxSet::load_defaults_nonewlines(),
             syntax_theme: test_theme(),
@@ -2524,6 +2564,33 @@ mod tests {
         assert_eq!(line.spans[0].content.as_ref(), "review note");
         assert_eq!(line.spans[1].content.as_ref(), "▊");
         assert_eq!(line.spans[1].style.fg, Some(Color::Rgb(216, 180, 84)));
+    }
+
+    #[test]
+    fn file_list_scroll_keeps_selection_visible_without_edge_pinning() {
+        let temp = TempDirGuard::new();
+        let files = (0..10)
+            .map(|idx| file_summary(&format!("src/{idx}.rs")))
+            .collect();
+        let mut app = test_app(temp.path.clone(), files);
+        app.filtered_file_indices = (0..10).collect();
+        app.last_files_inner_height = 4;
+
+        app.selected_file_view_idx = 4;
+        app.ensure_file_selection_visible();
+        assert_eq!(app.file_list_scroll, 1);
+
+        app.selected_file_view_idx = 3;
+        app.ensure_file_selection_visible();
+        assert_eq!(app.file_list_scroll, 1);
+
+        app.selected_file_view_idx = 1;
+        app.ensure_file_selection_visible();
+        assert_eq!(app.file_list_scroll, 1);
+
+        app.selected_file_view_idx = 0;
+        app.ensure_file_selection_visible();
+        assert_eq!(app.file_list_scroll, 0);
     }
 
     #[test]
