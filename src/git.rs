@@ -234,7 +234,7 @@ fn resolve_stack_review(root: &Path, leaf_branch: &str, base_branch: &str) -> Re
     let mut reversed_edges = Vec::new();
 
     while current != base_branch {
-        let parent = infer_parent_branch(root, &current, base_branch)?;
+        let parent = infer_parent_branch(root, &current, base_branch, &reversed_chain)?;
         reversed_edges.push(ReviewEdge {
             base: parent.clone(),
             head: current.clone(),
@@ -261,10 +261,25 @@ fn resolve_stack_review(root: &Path, leaf_branch: &str, base_branch: &str) -> Re
     })
 }
 
-fn infer_parent_branch(root: &Path, head_branch: &str, base_branch: &str) -> Result<String> {
+fn infer_parent_branch(
+    root: &Path,
+    head_branch: &str,
+    base_branch: &str,
+    visited: &[String],
+) -> Result<String> {
+    let head_sha = rev_parse(root, head_branch)?;
     let mut scored = Vec::new();
     for candidate in local_branches(root)? {
         if candidate == head_branch {
+            continue;
+        }
+
+        if visited.iter().any(|branch| branch == &candidate) {
+            continue;
+        }
+
+        let candidate_sha = rev_parse(root, &candidate)?;
+        if candidate_sha != head_sha && is_ancestor(root, head_branch, &candidate)? {
             continue;
         }
 
@@ -273,9 +288,6 @@ fn infer_parent_branch(root: &Path, head_branch: &str, base_branch: &str) -> Res
         }
 
         let head_ahead = rev_list_count(root, &format!("{candidate}..{head_branch}"))?;
-        if head_ahead == 0 {
-            continue;
-        }
 
         let parent_ahead = rev_list_count(root, &format!("{head_branch}..{candidate}"))?;
         let merge_base = run_git(
@@ -283,7 +295,6 @@ fn infer_parent_branch(root: &Path, head_branch: &str, base_branch: &str) -> Res
             ["merge-base", candidate.as_str(), head_branch].as_slice(),
         )?;
         let merge_base = merge_base.trim();
-        let candidate_sha = rev_parse(root, &candidate)?;
         if merge_base != candidate_sha {
             continue;
         }
@@ -292,21 +303,28 @@ fn infer_parent_branch(root: &Path, head_branch: &str, base_branch: &str) -> Res
     }
 
     scored.sort_by(|left, right| {
-        left.1
-            .cmp(&right.1)
+        (right.1 == 0)
+            .cmp(&(left.1 == 0))
+            .then(left.1.cmp(&right.1))
             .then(left.2.cmp(&right.2))
             .then(left.0.cmp(&right.0))
     });
 
     let Some(best) = scored.first() else {
+        if base_branch != head_branch
+            && !visited.iter().any(|branch| branch == base_branch)
+            && local_branch_exists(root, base_branch)?
+        {
+            return Ok(base_branch.to_string());
+        }
+
         bail!("could not infer a parent branch for {head_branch} before reaching {base_branch}");
     };
 
-    if scored
-        .iter()
-        .skip(1)
-        .any(|candidate| candidate.1 == best.1 && candidate.2 == best.2)
-    {
+    let best_is_same_tip = best.1 == 0;
+    if scored.iter().skip(1).any(|candidate| {
+        (candidate.1 == 0) == best_is_same_tip && candidate.1 == best.1 && candidate.2 == best.2
+    }) {
         bail!("could not infer a unique parent branch for {head_branch}");
     }
 
@@ -732,6 +750,75 @@ index 1111111..2222222 100644
                 "feat/a...feat/b".to_string(),
                 "feat/b...feat/c".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn resolves_stack_when_leaf_matches_parent_tip() {
+        let temp = TempDir::new().expect("tempdir should be created");
+        git(&temp, &["init", "-b", "main"]);
+        git(&temp, &["config", "user.name", "Test User"]);
+        git(&temp, &["config", "user.email", "test@example.com"]);
+
+        commit_file(&temp, "base\n", "base");
+        git(&temp, &["checkout", "-b", "feat/a"]);
+        commit_file(&temp, "base\na\n", "feat a");
+        git(&temp, &["checkout", "-b", "feat/b"]);
+
+        let stack = resolve_stack_review(temp.path(), "feat/b", "main")
+            .expect("stack should resolve with same-tip parent");
+
+        assert_eq!(
+            stack.chain,
+            vec![
+                "main".to_string(),
+                "feat/a".to_string(),
+                "feat/b".to_string()
+            ]
+        );
+        assert_eq!(
+            stack
+                .edges
+                .iter()
+                .map(ReviewEdge::label)
+                .collect::<Vec<_>>(),
+            vec!["main...feat/a".to_string(), "feat/a...feat/b".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolves_stack_when_base_branch_has_moved_on() {
+        let temp = TempDir::new().expect("tempdir should be created");
+        git(&temp, &["init", "-b", "main"]);
+        git(&temp, &["config", "user.name", "Test User"]);
+        git(&temp, &["config", "user.email", "test@example.com"]);
+
+        commit_file(&temp, "base\n", "base");
+        git(&temp, &["checkout", "-b", "feat/a"]);
+        commit_file(&temp, "base\na\n", "feat a");
+        git(&temp, &["checkout", "-b", "feat/b"]);
+        commit_file(&temp, "base\na\nb\n", "feat b");
+        git(&temp, &["checkout", "main"]);
+        commit_file(&temp, "base\nmain-followup\n", "main followup");
+
+        let stack = resolve_stack_review(temp.path(), "feat/b", "main")
+            .expect("stack should resolve even when base has advanced");
+
+        assert_eq!(
+            stack.chain,
+            vec![
+                "main".to_string(),
+                "feat/a".to_string(),
+                "feat/b".to_string()
+            ]
+        );
+        assert_eq!(
+            stack
+                .edges
+                .iter()
+                .map(ReviewEdge::label)
+                .collect::<Vec<_>>(),
+            vec!["main...feat/a".to_string(), "feat/a...feat/b".to_string()]
         );
     }
 }
