@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::ffi::OsStr;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -11,13 +12,13 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use syntect::easy::HighlightLines;
-use syntect::highlighting::{Theme, ThemeSet};
+use syntect::highlighting::{FontStyle, Theme, ThemeSet};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
 
 use crate::cli::ReviewArgs;
@@ -37,12 +38,21 @@ const TWO_ROW_BREAKPOINT: u16 = 100;
 const PATCH_CACHE_LIMIT: usize = 16;
 const WHOLE_FILE_CACHE_LIMIT: usize = 2;
 const WHOLE_FILE_HIGHLIGHT_LINE_LIMIT: usize = 512;
+const DEFAULT_DARK_THEME_CANDIDATES: [&str; 4] = [
+    "base16-mocha.dark",
+    "base16-ocean.dark",
+    "base16-eighties.dark",
+    "Solarized (dark)",
+];
+const DEFAULT_LIGHT_THEME_CANDIDATES: [&str; 3] =
+    ["base16-ocean.light", "InspiredGitHub", "Solarized (light)"];
 
 pub fn run(args: ReviewArgs) -> Result<()> {
     let resolved = ResolvedReview::discover(&args)?;
     let files = resolved.repo.load_files()?;
-
-    let mut app = App::new(resolved.repo, files, resolved.stack);
+    let env_theme = std::env::var("REB_THEME").ok();
+    let requested_theme = args.theme.as_deref().or(env_theme.as_deref());
+    let mut app = App::new(resolved.repo, files, resolved.stack, requested_theme)?;
     let mut terminal = TerminalSession::new()?;
 
     while !app.should_quit {
@@ -210,15 +220,15 @@ struct App {
 }
 
 impl App {
-    fn new(repo: GitRepo, files: Vec<FileSummary>, stack_review: Option<StackReview>) -> Self {
+    fn new(
+        repo: GitRepo,
+        files: Vec<FileSummary>,
+        stack_review: Option<StackReview>,
+        requested_theme: Option<&str>,
+    ) -> Result<Self> {
         let syntax_set = SyntaxSet::load_defaults_nonewlines();
         let theme_set = ThemeSet::load_defaults();
-        let syntax_theme = theme_set
-            .themes
-            .get("base16-ocean.dark")
-            .cloned()
-            .or_else(|| theme_set.themes.values().next().cloned())
-            .unwrap_or_default();
+        let (_syntax_theme_name, syntax_theme) = resolve_syntax_theme(&theme_set, requested_theme)?;
 
         let mut app = Self {
             repo,
@@ -260,7 +270,7 @@ impl App {
         } else {
             app.load_selected_patch();
         }
-        app
+        Ok(app)
     }
 
     fn on_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -1186,15 +1196,20 @@ impl App {
                     } else {
                         file.path.clone()
                     };
-                    let style =
-                        if self.focus == Focus::Files && view_idx == self.selected_file_view_idx {
+                    let style = if view_idx == self.selected_file_view_idx {
+                        if self.focus == Focus::Files {
                             Style::default()
                                 .fg(Color::Black)
                                 .bg(Color::Rgb(208, 221, 255))
                                 .add_modifier(Modifier::BOLD)
                         } else {
                             Style::default()
-                        };
+                                .fg(Color::Rgb(225, 232, 244))
+                                .bg(Color::Rgb(45, 54, 70))
+                        }
+                    } else {
+                        Style::default()
+                    };
                     ListItem::new(Line::from(vec![
                         Span::styled(comment_marker, Style::default().fg(Color::Yellow)),
                         Span::styled(
@@ -1413,9 +1428,9 @@ impl App {
 
         let base_style = diff_base_style(line.kind);
         let line_style = if selected {
-            base_style.bg(Color::Rgb(50, 61, 82))
+            base_style.bg(diff_cursor_bg())
         } else if in_selection {
-            base_style.bg(Color::Rgb(32, 42, 58))
+            base_style.bg(diff_selection_bg())
         } else {
             base_style
         };
@@ -1475,9 +1490,9 @@ impl App {
 
         let base_style = whole_file_base_style(line.diff_kind);
         let line_style = if selected {
-            base_style.bg(Color::Rgb(50, 61, 82))
+            base_style.bg(diff_cursor_bg())
         } else if in_selection {
-            base_style.bg(Color::Rgb(32, 42, 58))
+            base_style.bg(diff_selection_bg())
         } else {
             base_style
         };
@@ -1611,6 +1626,12 @@ impl App {
     }
 
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
+        let metadata = self.footer_metadata();
+        let metadata_width = metadata.chars().count().min(area.width as usize) as u16;
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(0), Constraint::Length(metadata_width)])
+            .split(area);
         let status = if let Some(notification) = &self.notification {
             let color = match notification.kind {
                 NotificationKind::Success => Color::Rgb(149, 198, 136),
@@ -1641,7 +1662,15 @@ impl App {
             Line::from(help)
         };
 
-        frame.render_widget(Paragraph::new(status), area);
+        frame.render_widget(Paragraph::new(status), chunks[0]);
+        frame.render_widget(
+            Paragraph::new(metadata).alignment(Alignment::Right),
+            chunks[1],
+        );
+    }
+
+    fn footer_metadata(&self) -> String {
+        format!("reb v{}", env!("CARGO_PKG_VERSION"))
     }
 
     fn refresh_filtered_files(&mut self) {
@@ -2534,13 +2563,118 @@ fn highlight_line_segments(
         .into_iter()
         .map(|(style, segment)| StyledSegment {
             text: segment.to_string(),
-            style: Style::default().fg(Color::Rgb(
-                style.foreground.r,
-                style.foreground.g,
-                style.foreground.b,
-            )),
+            style: syntect_style_to_ratatui(style),
         })
         .collect()
+}
+
+fn resolve_syntax_theme(
+    theme_set: &ThemeSet,
+    requested_theme: Option<&str>,
+) -> Result<(String, Theme)> {
+    if let Some(theme_name) = requested_theme {
+        let theme = theme_set.themes.get(theme_name).cloned().with_context(|| {
+            let available = available_theme_names(theme_set).join(", ");
+            format!("unknown syntax theme `{theme_name}`; available themes: {available}")
+        })?;
+        return Ok((theme_name.to_string(), theme));
+    }
+
+    for &theme_name in adaptive_default_theme_candidates() {
+        if let Some(theme) = theme_set.themes.get(theme_name).cloned() {
+            return Ok((theme_name.to_string(), theme));
+        }
+    }
+
+    let (theme_name, theme) = theme_set
+        .themes
+        .iter()
+        .next()
+        .map(|(name, theme)| (name.clone(), theme.clone()))
+        .unwrap_or_else(|| ("default".to_string(), Theme::default()));
+    Ok((theme_name, theme))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalThemeMode {
+    Light,
+    Dark,
+}
+
+fn adaptive_default_theme_candidates() -> &'static [&'static str] {
+    default_theme_candidates_for_mode(detect_terminal_theme_mode())
+}
+
+fn default_theme_candidates_for_mode(mode: TerminalThemeMode) -> &'static [&'static str] {
+    match mode {
+        TerminalThemeMode::Light => &DEFAULT_LIGHT_THEME_CANDIDATES,
+        TerminalThemeMode::Dark => &DEFAULT_DARK_THEME_CANDIDATES,
+    }
+}
+
+fn detect_terminal_theme_mode() -> TerminalThemeMode {
+    detect_terminal_theme_mode_with_env(
+        std::env::var_os("REB_THEME_MODE"),
+        std::env::var_os("COLORFGBG"),
+    )
+}
+
+fn detect_terminal_theme_mode_with_env(
+    mode_override: Option<std::ffi::OsString>,
+    colorfgbg: Option<std::ffi::OsString>,
+) -> TerminalThemeMode {
+    if let Some(mode) = mode_override.as_deref().and_then(parse_theme_mode_override) {
+        return mode;
+    }
+
+    if let Some(mode) = colorfgbg.as_deref().and_then(parse_colorfgbg_theme_mode) {
+        return mode;
+    }
+
+    TerminalThemeMode::Dark
+}
+
+fn parse_theme_mode_override(value: &OsStr) -> Option<TerminalThemeMode> {
+    match value.to_string_lossy().trim().to_ascii_lowercase().as_str() {
+        "light" => Some(TerminalThemeMode::Light),
+        "dark" => Some(TerminalThemeMode::Dark),
+        _ => None,
+    }
+}
+
+fn parse_colorfgbg_theme_mode(value: &OsStr) -> Option<TerminalThemeMode> {
+    let value = value.to_string_lossy();
+    let last = value.rsplit(';').next()?.trim();
+    let bg_index: u8 = last.parse().ok()?;
+    Some(if bg_index <= 6 || bg_index == 8 {
+        TerminalThemeMode::Dark
+    } else {
+        TerminalThemeMode::Light
+    })
+}
+
+fn available_theme_names(theme_set: &ThemeSet) -> Vec<String> {
+    let mut names: Vec<_> = theme_set.themes.keys().cloned().collect();
+    names.sort();
+    names
+}
+
+fn syntect_style_to_ratatui(style: syntect::highlighting::Style) -> Style {
+    let mut output = Style::default().fg(Color::Rgb(
+        style.foreground.r,
+        style.foreground.g,
+        style.foreground.b,
+    ));
+    if style.font_style.contains(FontStyle::BOLD) {
+        output = output.add_modifier(Modifier::BOLD);
+    }
+    if style.font_style.contains(FontStyle::ITALIC) {
+        output = output.add_modifier(Modifier::ITALIC);
+    }
+    if style.font_style.contains(FontStyle::UNDERLINE) {
+        output = output.add_modifier(Modifier::UNDERLINED);
+    }
+    output
 }
 
 fn change_badge(change: &ChangeKind) -> &'static str {
@@ -2578,17 +2712,25 @@ fn diff_sign_color(kind: Option<DiffKind>) -> Color {
 
 fn diff_base_style(kind: DiffKind) -> Style {
     match kind {
-        DiffKind::Add => Style::default().bg(Color::Rgb(18, 40, 26)),
-        DiffKind::Delete => Style::default().bg(Color::Rgb(50, 22, 22)),
-        DiffKind::Context => Style::default().bg(Color::Rgb(18, 20, 26)),
+        DiffKind::Add => Style::default().bg(Color::Rgb(33, 58, 43)),
+        DiffKind::Delete => Style::default().bg(Color::Rgb(74, 34, 29)),
+        DiffKind::Context => Style::default(),
     }
 }
 
 fn whole_file_base_style(kind: Option<DiffKind>) -> Style {
     match kind {
         Some(kind) => diff_base_style(kind),
-        None => Style::default().bg(Color::Rgb(15, 17, 22)),
+        None => Style::default(),
     }
+}
+
+fn diff_selection_bg() -> Color {
+    Color::Rgb(37, 51, 68)
+}
+
+fn diff_cursor_bg() -> Color {
+    Color::Rgb(52, 70, 91)
 }
 
 fn panel_border(active: bool) -> Style {
@@ -2654,12 +2796,9 @@ mod tests {
 
     fn test_theme() -> Theme {
         let theme_set = ThemeSet::load_defaults();
-        theme_set
-            .themes
-            .get("base16-ocean.dark")
-            .cloned()
-            .or_else(|| theme_set.themes.values().next().cloned())
-            .unwrap_or_default()
+        resolve_syntax_theme(&theme_set, None)
+            .expect("default test theme should resolve")
+            .1
     }
 
     fn file_summary(path: &str) -> FileSummary {
@@ -3159,6 +3298,79 @@ mod tests {
         assert_eq!(line.spans[0].content.as_ref(), "review note");
         assert_eq!(line.spans[1].content.as_ref(), "▊");
         assert_eq!(line.spans[1].style.fg, Some(Color::Rgb(216, 180, 84)));
+    }
+
+    #[test]
+    fn resolves_requested_theme_by_name() {
+        let theme_set = ThemeSet::load_defaults();
+
+        let (name, _) = resolve_syntax_theme(&theme_set, Some("InspiredGitHub"))
+            .expect("requested theme should resolve");
+
+        assert_eq!(name, "InspiredGitHub");
+    }
+
+    #[test]
+    fn reports_available_themes_for_unknown_name() {
+        let theme_set = ThemeSet::load_defaults();
+
+        let err = resolve_syntax_theme(&theme_set, Some("not-a-real-theme"))
+            .expect_err("unknown theme should fail");
+        let message = format!("{err:#}");
+
+        assert!(message.contains("unknown syntax theme `not-a-real-theme`"));
+        assert!(message.contains("available themes:"));
+    }
+
+    #[test]
+    fn footer_metadata_includes_version_and_theme() {
+        let temp = TempDirGuard::new();
+        let app = test_app(temp.path.clone(), vec![file_summary("src/demo.rs")]);
+
+        let metadata = app.footer_metadata();
+
+        assert!(metadata.contains(env!("CARGO_PKG_VERSION")));
+        assert_eq!(metadata, format!("reb v{}", env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn detects_dark_theme_mode_by_default() {
+        assert_eq!(
+            detect_terminal_theme_mode_with_env(None, None),
+            TerminalThemeMode::Dark
+        );
+    }
+
+    #[test]
+    fn detects_light_theme_mode_from_override() {
+        assert_eq!(
+            detect_terminal_theme_mode_with_env(Some("light".into()), None),
+            TerminalThemeMode::Light
+        );
+    }
+
+    #[test]
+    fn detects_light_theme_mode_from_colorfgbg() {
+        assert_eq!(
+            detect_terminal_theme_mode_with_env(None, Some("15;0".into())),
+            TerminalThemeMode::Dark
+        );
+        assert_eq!(
+            detect_terminal_theme_mode_with_env(None, Some("0;15".into())),
+            TerminalThemeMode::Light
+        );
+    }
+
+    #[test]
+    fn light_mode_uses_light_candidate_list() {
+        assert_eq!(
+            default_theme_candidates_for_mode(TerminalThemeMode::Light),
+            &DEFAULT_LIGHT_THEME_CANDIDATES
+        );
+        assert_eq!(
+            default_theme_candidates_for_mode(TerminalThemeMode::Dark),
+            &DEFAULT_DARK_THEME_CANDIDATES
+        );
     }
 
     #[test]
