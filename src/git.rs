@@ -5,28 +5,90 @@ use std::{fs, path::Path};
 use anyhow::{Context, Result, bail};
 
 use crate::cli::ReviewArgs;
-use crate::model::{ChangeKind, DiffKind, FilePatch, FileSummary, PatchHunk, PatchLine};
+use crate::model::{
+    ChangeKind, DiffKind, FilePatch, FileSummary, PatchHunk, PatchLine, ReviewEdge,
+};
+
+#[derive(Debug, Clone)]
+pub struct ResolvedReview {
+    pub repo: GitRepo,
+    pub stack: Option<StackReview>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StackReview {
+    pub base_branch: String,
+    pub leaf_branch: String,
+    pub chain: Vec<String>,
+    pub edges: Vec<ReviewEdge>,
+}
 
 #[derive(Debug, Clone)]
 pub struct GitRepo {
     pub root: PathBuf,
     pub base: String,
+    pub head: Option<String>,
     pub staged: bool,
     pub pathspecs: Vec<String>,
 }
 
-impl GitRepo {
+impl ResolvedReview {
     pub fn discover(args: &ReviewArgs) -> Result<Self> {
-        let root = run_git(
-            &std::env::current_dir().context("failed to get current directory")?,
-            ["rev-parse", "--show-toplevel"].as_slice(),
-        )?;
+        let root = PathBuf::from(
+            run_git(
+                &std::env::current_dir().context("failed to get current directory")?,
+                ["rev-parse", "--show-toplevel"].as_slice(),
+            )?
+            .trim(),
+        );
+
+        if let Some(leaf_branch) = &args.stack {
+            let base_branch = resolve_stack_base(&root, &args.base)?;
+            let stack = resolve_stack_review(&root, leaf_branch, &base_branch)?;
+            let current_edge = stack
+                .edges
+                .last()
+                .cloned()
+                .context("resolved stack contains no review edges")?;
+
+            return Ok(Self {
+                repo: GitRepo::for_edge(root, current_edge, args.path.clone()),
+                stack: Some(stack),
+            });
+        }
 
         Ok(Self {
-            root: PathBuf::from(root.trim()),
-            base: args.base.clone(),
-            staged: args.staged,
-            pathspecs: args.path.clone(),
+            repo: GitRepo::for_worktree(root, args.base.clone(), args.staged, args.path.clone()),
+            stack: None,
+        })
+    }
+}
+
+impl GitRepo {
+    pub fn for_worktree(root: PathBuf, base: String, staged: bool, pathspecs: Vec<String>) -> Self {
+        Self {
+            root,
+            base,
+            head: None,
+            staged,
+            pathspecs,
+        }
+    }
+
+    pub fn for_edge(root: PathBuf, edge: ReviewEdge, pathspecs: Vec<String>) -> Self {
+        Self {
+            root,
+            base: edge.base,
+            head: Some(edge.head),
+            staged: false,
+            pathspecs,
+        }
+    }
+
+    pub fn current_edge(&self) -> Option<ReviewEdge> {
+        self.head.as_ref().map(|head| ReviewEdge {
+            base: self.base.clone(),
+            head: head.clone(),
         })
     }
 
@@ -66,6 +128,12 @@ impl GitRepo {
             return Ok(None);
         }
 
+        if let Some(head) = &self.head {
+            let spec = format!("{head}:{}", summary.path);
+            let output = run_git(&self.root, ["show", "--no-color", spec.as_str()].as_slice())?;
+            return Ok(Some(output));
+        }
+
         if self.staged {
             let spec = format!(":{}", summary.path);
             let output = run_git(&self.root, ["show", "--no-color", spec.as_str()].as_slice())?;
@@ -83,10 +151,10 @@ impl GitRepo {
     fn run_diff(&self, extra_args: &[&str]) -> Result<String> {
         let mut args: Vec<String> = vec!["diff".to_string()];
         args.extend(extra_args.iter().map(|arg| (*arg).to_string()));
-        if self.staged {
+        if self.head.is_none() && self.staged {
             args.push("--cached".to_string());
         }
-        args.push(self.base.clone());
+        args.push(self.diff_target());
         if !self.pathspecs.is_empty() {
             args.push("--".to_string());
             args.extend(self.pathspecs.iter().cloned());
@@ -100,10 +168,10 @@ impl GitRepo {
     fn run_diff_for_path(&self, extra_args: &[&str], path: &str) -> Result<String> {
         let mut args: Vec<String> = vec!["diff".to_string()];
         args.extend(extra_args.iter().map(|arg| (*arg).to_string()));
-        if self.staged {
+        if self.head.is_none() && self.staged {
             args.push("--cached".to_string());
         }
-        args.push(self.base.clone());
+        args.push(self.diff_target());
         args.push("--".to_string());
         if !self.pathspecs.is_empty() {
             args.extend(self.pathspecs.iter().cloned());
@@ -114,6 +182,209 @@ impl GitRepo {
             &args.iter().map(String::as_str).collect::<Vec<_>>(),
         )
     }
+
+    fn diff_target(&self) -> String {
+        match &self.head {
+            Some(head) => format!("{}...{}", self.base, head),
+            None => self.base.clone(),
+        }
+    }
+}
+
+fn resolve_stack_base(root: &Path, requested_base: &str) -> Result<String> {
+    if requested_base != "HEAD" {
+        ensure_local_branch(root, requested_base)?;
+        return Ok(requested_base.to_string());
+    }
+
+    if let Some(default_branch) = resolve_default_branch(root)? {
+        return Ok(default_branch);
+    }
+
+    bail!("failed to resolve default base branch; pass --base explicitly");
+}
+
+fn resolve_default_branch(root: &Path) -> Result<Option<String>> {
+    if let Ok(symbolic_ref) = run_git(
+        root,
+        ["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"].as_slice(),
+    ) && let Some(branch) = symbolic_ref.trim().rsplit('/').next()
+        && local_branch_exists(root, branch)?
+    {
+        return Ok(Some(branch.to_string()));
+    }
+
+    for fallback in ["main", "master"] {
+        if local_branch_exists(root, fallback)? {
+            return Ok(Some(fallback.to_string()));
+        }
+    }
+
+    Ok(None)
+}
+
+fn resolve_stack_review(root: &Path, leaf_branch: &str, base_branch: &str) -> Result<StackReview> {
+    ensure_local_branch(root, leaf_branch)?;
+    ensure_local_branch(root, base_branch)?;
+
+    let mut current = leaf_branch.to_string();
+    let mut reversed_chain = vec![current.clone()];
+    let mut reversed_edges = Vec::new();
+
+    while current != base_branch {
+        let parent = infer_parent_branch(root, &current, base_branch, &reversed_chain)?;
+        reversed_edges.push(ReviewEdge {
+            base: parent.clone(),
+            head: current.clone(),
+        });
+        current = parent;
+        if reversed_chain.contains(&current) {
+            bail!("detected a loop while resolving stack at branch {current}");
+        }
+        reversed_chain.push(current.clone());
+    }
+
+    reversed_chain.reverse();
+    reversed_edges.reverse();
+
+    if reversed_edges.is_empty() {
+        bail!("stack leaf {leaf_branch} is already at base {base_branch}");
+    }
+
+    Ok(StackReview {
+        base_branch: base_branch.to_string(),
+        leaf_branch: leaf_branch.to_string(),
+        chain: reversed_chain,
+        edges: reversed_edges,
+    })
+}
+
+fn infer_parent_branch(
+    root: &Path,
+    head_branch: &str,
+    base_branch: &str,
+    visited: &[String],
+) -> Result<String> {
+    let head_sha = rev_parse(root, head_branch)?;
+    let mut scored = Vec::new();
+    for candidate in local_branches(root)? {
+        if candidate == head_branch {
+            continue;
+        }
+
+        if visited.iter().any(|branch| branch == &candidate) {
+            continue;
+        }
+
+        let candidate_sha = rev_parse(root, &candidate)?;
+        if candidate_sha != head_sha && is_ancestor(root, head_branch, &candidate)? {
+            continue;
+        }
+
+        if !is_ancestor(root, &candidate, head_branch)? {
+            continue;
+        }
+
+        let head_ahead = rev_list_count(root, &format!("{candidate}..{head_branch}"))?;
+
+        let parent_ahead = rev_list_count(root, &format!("{head_branch}..{candidate}"))?;
+        let merge_base = run_git(
+            root,
+            ["merge-base", candidate.as_str(), head_branch].as_slice(),
+        )?;
+        let merge_base = merge_base.trim();
+        if merge_base != candidate_sha {
+            continue;
+        }
+
+        scored.push((candidate, head_ahead, parent_ahead));
+    }
+
+    scored.sort_by(|left, right| {
+        (right.1 == 0)
+            .cmp(&(left.1 == 0))
+            .then(left.1.cmp(&right.1))
+            .then(left.2.cmp(&right.2))
+            .then(left.0.cmp(&right.0))
+    });
+
+    let Some(best) = scored.first() else {
+        if base_branch != head_branch
+            && !visited.iter().any(|branch| branch == base_branch)
+            && local_branch_exists(root, base_branch)?
+        {
+            return Ok(base_branch.to_string());
+        }
+
+        bail!("could not infer a parent branch for {head_branch} before reaching {base_branch}");
+    };
+
+    let best_is_same_tip = best.1 == 0;
+    if scored.iter().skip(1).any(|candidate| {
+        (candidate.1 == 0) == best_is_same_tip && candidate.1 == best.1 && candidate.2 == best.2
+    }) {
+        bail!("could not infer a unique parent branch for {head_branch}");
+    }
+
+    Ok(best.0.clone())
+}
+
+fn local_branches(root: &Path) -> Result<Vec<String>> {
+    Ok(run_git(
+        root,
+        ["for-each-ref", "--format=%(refname:short)", "refs/heads"].as_slice(),
+    )?
+    .lines()
+    .map(str::trim)
+    .filter(|line| !line.is_empty())
+    .map(ToString::to_string)
+    .collect())
+}
+
+fn ensure_local_branch(root: &Path, branch: &str) -> Result<()> {
+    if local_branch_exists(root, branch)? {
+        return Ok(());
+    }
+
+    bail!("branch {branch} does not exist locally");
+}
+
+fn local_branch_exists(root: &Path, branch: &str) -> Result<bool> {
+    let output = Command::new("git")
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ])
+        .current_dir(root)
+        .output()
+        .with_context(|| format!("failed to check branch {branch}"))?;
+    Ok(output.status.success())
+}
+
+fn is_ancestor(root: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
+    let output = Command::new("git")
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .current_dir(root)
+        .output()
+        .with_context(|| format!("failed to compare ancestry for {ancestor} and {descendant}"))?;
+
+    Ok(output.status.success())
+}
+
+fn rev_list_count(root: &Path, range: &str) -> Result<u64> {
+    let output = run_git(root, ["rev-list", "--count", range].as_slice())?;
+    output
+        .trim()
+        .parse()
+        .with_context(|| format!("failed to parse rev-list count for {range}"))
+}
+
+fn rev_parse(root: &Path, rev: &str) -> Result<String> {
+    Ok(run_git(root, ["rev-parse", rev].as_slice())?
+        .trim()
+        .to_string())
 }
 
 fn run_git(root: &std::path::Path, args: &[&str]) -> Result<String> {
@@ -325,6 +596,7 @@ fn should_keep_metadata(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     fn summary(path: &str) -> FileSummary {
         FileSummary {
@@ -416,5 +688,135 @@ index 1111111..2222222 100644
 
         assert!(patch.hunks.is_empty());
         assert_eq!(patch.metadata, vec!["Renamed: old.rs -> new.rs"]);
+    }
+
+    fn git(temp: &TempDir, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(temp.path())
+            .output()
+            .expect("git should run");
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn commit_file(temp: &TempDir, contents: &str, message: &str) {
+        fs::write(temp.path().join("stack.txt"), contents).expect("file should be written");
+        git(temp, &["add", "stack.txt"]);
+        git(temp, &["commit", "-m", message]);
+    }
+
+    #[test]
+    fn resolves_linear_stack_from_leaf_branch() {
+        let temp = TempDir::new().expect("tempdir should be created");
+        git(&temp, &["init", "-b", "main"]);
+        git(&temp, &["config", "user.name", "Test User"]);
+        git(&temp, &["config", "user.email", "test@example.com"]);
+
+        commit_file(&temp, "base\n", "base");
+        git(&temp, &["checkout", "-b", "feat/a"]);
+        commit_file(&temp, "base\na\n", "feat a");
+        git(&temp, &["checkout", "-b", "feat/b"]);
+        commit_file(&temp, "base\na\nb\n", "feat b");
+        git(&temp, &["checkout", "-b", "feat/c"]);
+        commit_file(&temp, "base\na\nb\nc\n", "feat c");
+
+        let stack =
+            resolve_stack_review(temp.path(), "feat/c", "main").expect("stack should resolve");
+
+        assert_eq!(
+            stack.chain,
+            vec![
+                "main".to_string(),
+                "feat/a".to_string(),
+                "feat/b".to_string(),
+                "feat/c".to_string()
+            ]
+        );
+        assert_eq!(
+            stack
+                .edges
+                .iter()
+                .map(ReviewEdge::label)
+                .collect::<Vec<_>>(),
+            vec![
+                "main...feat/a".to_string(),
+                "feat/a...feat/b".to_string(),
+                "feat/b...feat/c".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn resolves_stack_when_leaf_matches_parent_tip() {
+        let temp = TempDir::new().expect("tempdir should be created");
+        git(&temp, &["init", "-b", "main"]);
+        git(&temp, &["config", "user.name", "Test User"]);
+        git(&temp, &["config", "user.email", "test@example.com"]);
+
+        commit_file(&temp, "base\n", "base");
+        git(&temp, &["checkout", "-b", "feat/a"]);
+        commit_file(&temp, "base\na\n", "feat a");
+        git(&temp, &["checkout", "-b", "feat/b"]);
+
+        let stack = resolve_stack_review(temp.path(), "feat/b", "main")
+            .expect("stack should resolve with same-tip parent");
+
+        assert_eq!(
+            stack.chain,
+            vec![
+                "main".to_string(),
+                "feat/a".to_string(),
+                "feat/b".to_string()
+            ]
+        );
+        assert_eq!(
+            stack
+                .edges
+                .iter()
+                .map(ReviewEdge::label)
+                .collect::<Vec<_>>(),
+            vec!["main...feat/a".to_string(), "feat/a...feat/b".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolves_stack_when_base_branch_has_moved_on() {
+        let temp = TempDir::new().expect("tempdir should be created");
+        git(&temp, &["init", "-b", "main"]);
+        git(&temp, &["config", "user.name", "Test User"]);
+        git(&temp, &["config", "user.email", "test@example.com"]);
+
+        commit_file(&temp, "base\n", "base");
+        git(&temp, &["checkout", "-b", "feat/a"]);
+        commit_file(&temp, "base\na\n", "feat a");
+        git(&temp, &["checkout", "-b", "feat/b"]);
+        commit_file(&temp, "base\na\nb\n", "feat b");
+        git(&temp, &["checkout", "main"]);
+        commit_file(&temp, "base\nmain-followup\n", "main followup");
+
+        let stack = resolve_stack_review(temp.path(), "feat/b", "main")
+            .expect("stack should resolve even when base has advanced");
+
+        assert_eq!(
+            stack.chain,
+            vec![
+                "main".to_string(),
+                "feat/a".to_string(),
+                "feat/b".to_string()
+            ]
+        );
+        assert_eq!(
+            stack
+                .edges
+                .iter()
+                .map(ReviewEdge::label)
+                .collect::<Vec<_>>(),
+            vec!["main...feat/a".to_string(), "feat/a...feat/b".to_string()]
+        );
     }
 }
