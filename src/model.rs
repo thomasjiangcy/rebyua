@@ -47,6 +47,18 @@ pub struct FilePatch {
     pub metadata: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ReviewEdge {
+    pub base: String,
+    pub head: String,
+}
+
+impl ReviewEdge {
+    pub fn label(&self) -> String {
+        format!("{}...{}", self.base, self.head)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LineReference {
     pub old_lineno: Option<usize>,
@@ -57,6 +69,7 @@ pub struct LineReference {
 pub struct Annotation {
     pub id: u64,
     pub file_path: String,
+    pub edge: Option<ReviewEdge>,
     pub hunk_header: Option<String>,
     pub scope: AnnotationScope,
     pub body: String,
@@ -77,6 +90,7 @@ impl Annotation {
     pub fn created_for_lines(
         id: u64,
         file_path: String,
+        edge: Option<ReviewEdge>,
         hunk_header: Option<String>,
         range: AnnotationLineRange,
         body: String,
@@ -84,6 +98,7 @@ impl Annotation {
         Self {
             id,
             file_path,
+            edge,
             hunk_header,
             scope: AnnotationScope::Lines {
                 start_line_idx: range.start_line_idx,
@@ -95,10 +110,16 @@ impl Annotation {
         }
     }
 
-    pub fn created_for_file(id: u64, file_path: String, body: String) -> Self {
+    pub fn created_for_file(
+        id: u64,
+        file_path: String,
+        edge: Option<ReviewEdge>,
+        body: String,
+    ) -> Self {
         Self {
             id,
             file_path,
+            edge,
             hunk_header: None,
             scope: AnnotationScope::File,
             body,

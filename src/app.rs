@@ -23,14 +23,15 @@ use syntect::parsing::{SyntaxReference, SyntaxSet};
 use crate::cli::ReviewArgs;
 use crate::clipboard;
 use crate::export;
-use crate::git::GitRepo;
+use crate::git::{GitRepo, ResolvedReview, StackReview};
 use crate::model::{
     Annotation, AnnotationLineRange, ChangeKind, DiffKind, FilePatch, FileSummary, Focus,
-    LineReference, PatchLine, SelectionRange,
+    LineReference, PatchLine, ReviewEdge, SelectionRange,
 };
 
 const NOTIFICATION_TTL: Duration = Duration::from_secs(3);
 const COMMENT_BOX_HEIGHT: u16 = 5;
+const STACK_HEADER_HEIGHT: u16 = 1;
 const FOOTER_HEIGHT: u16 = 1;
 const TWO_ROW_BREAKPOINT: u16 = 100;
 const PATCH_CACHE_LIMIT: usize = 16;
@@ -38,10 +39,10 @@ const WHOLE_FILE_CACHE_LIMIT: usize = 2;
 const WHOLE_FILE_HIGHLIGHT_LINE_LIMIT: usize = 512;
 
 pub fn run(args: ReviewArgs) -> Result<()> {
-    let repo = GitRepo::discover(&args)?;
-    let files = repo.load_files()?;
+    let resolved = ResolvedReview::discover(&args)?;
+    let files = resolved.repo.load_files()?;
 
-    let mut app = App::new(repo, files);
+    let mut app = App::new(resolved.repo, files, resolved.stack);
     let mut terminal = TerminalSession::new()?;
 
     while !app.should_quit {
@@ -175,6 +176,8 @@ enum SearchDirection {
 
 struct App {
     repo: GitRepo,
+    stack_review: Option<StackReview>,
+    current_edge_idx: usize,
     files: Vec<FileSummary>,
     filtered_file_indices: Vec<usize>,
     selected_file_view_idx: usize,
@@ -207,7 +210,7 @@ struct App {
 }
 
 impl App {
-    fn new(repo: GitRepo, files: Vec<FileSummary>) -> Self {
+    fn new(repo: GitRepo, files: Vec<FileSummary>, stack_review: Option<StackReview>) -> Self {
         let syntax_set = SyntaxSet::load_defaults_nonewlines();
         let theme_set = ThemeSet::load_defaults();
         let syntax_theme = theme_set
@@ -219,6 +222,11 @@ impl App {
 
         let mut app = Self {
             repo,
+            current_edge_idx: stack_review
+                .as_ref()
+                .map(|stack| stack.edges.len().saturating_sub(1))
+                .unwrap_or(0),
+            stack_review,
             files,
             filtered_file_indices: Vec::new(),
             selected_file_view_idx: 0,
@@ -286,6 +294,8 @@ impl App {
             }
             KeyCode::Char(']') => self.move_file_selection(1),
             KeyCode::Char('[') => self.move_file_selection(-1),
+            KeyCode::Char('>') => self.move_stack_edge(1)?,
+            KeyCode::Char('<') => self.move_stack_edge(-1)?,
             KeyCode::Char('n') if self.focus == Focus::Diff => {
                 self.repeat_last_search(SearchDirection::Forward)
             }
@@ -622,11 +632,13 @@ impl App {
         if body.is_empty() {
             return Ok(());
         }
+        let current_edge = self.current_review_edge();
 
         let annotation = match draft.target {
             CommentTarget::File => Annotation::created_for_file(
                 self.next_annotation_id,
                 summary.path.clone(),
+                current_edge.clone(),
                 body.to_string(),
             ),
             CommentTarget::Range(range) => match self.view_mode {
@@ -644,6 +656,7 @@ impl App {
                     Annotation::created_for_lines(
                         self.next_annotation_id,
                         summary.path.clone(),
+                        current_edge.clone(),
                         hunk_header,
                         AnnotationLineRange {
                             start_line_idx: start,
@@ -675,6 +688,7 @@ impl App {
                     Annotation::created_for_lines(
                         self.next_annotation_id,
                         summary.path.clone(),
+                        current_edge,
                         hunk_header,
                         AnnotationLineRange {
                             start_line_idx: start,
@@ -889,7 +903,16 @@ impl App {
     }
 
     fn export_to_clipboard(&mut self) {
-        let markdown = export::markdown(&self.repo.base, &self.files, &self.annotations);
+        let markdown = if let Some(stack) = &self.stack_review {
+            export::stack_markdown(
+                &stack.base_branch,
+                &stack.leaf_branch,
+                &stack.chain,
+                &self.annotations,
+            )
+        } else {
+            export::markdown(&self.repo.base, &self.files, &self.annotations)
+        };
         match clipboard::copy_to_clipboard(&markdown) {
             Ok(()) => self.set_notification(
                 "Review copied to clipboard".to_string(),
@@ -900,6 +923,66 @@ impl App {
                 NotificationKind::Error,
             ),
         }
+    }
+
+    fn move_stack_edge(&mut self, delta: isize) -> Result<()> {
+        let Some(stack) = &self.stack_review else {
+            return Ok(());
+        };
+
+        let next_idx = self
+            .current_edge_idx
+            .checked_add_signed(delta)
+            .filter(|idx| *idx < stack.edges.len());
+        let Some(next_idx) = next_idx else {
+            return Ok(());
+        };
+
+        let preferred_path = self
+            .selected_file_summary()
+            .map(|summary| summary.path.clone());
+        let edge = stack.edges[next_idx].clone();
+        let repo = GitRepo::for_edge(self.repo.root.clone(), edge, self.repo.pathspecs.clone());
+        let files = repo.load_files()?;
+
+        self.repo = repo;
+        self.files = files;
+        self.current_edge_idx = next_idx;
+        self.clear_edge_view_state(preferred_path);
+        Ok(())
+    }
+
+    fn clear_edge_view_state(&mut self, preferred_path: Option<String>) {
+        self.patch_cache.clear();
+        self.patch_cache_order.clear();
+        self.whole_file_cache.clear();
+        self.whole_file_cache_order.clear();
+        self.whole_file_highlight_cache.clear();
+        self.diff_cursor = 0;
+        self.diff_scroll = 0;
+        self.selection = None;
+        self.comment_draft = None;
+        self.expanded_comment_line = None;
+        self.prompt_input = None;
+        self.last_search_query = None;
+        self.notification = None;
+        self.view_mode = DiffViewMode::Patch;
+        self.refresh_filtered_files();
+
+        if let Some(preferred_path) = preferred_path
+            && let Some(view_idx) = self
+                .filtered_file_indices
+                .iter()
+                .position(|file_idx| self.files[*file_idx].path == preferred_path)
+        {
+            self.selected_file_view_idx = view_idx;
+            self.ensure_file_selection_visible();
+            self.reset_diff_view_for_selected_file();
+        }
+    }
+
+    fn current_review_edge(&self) -> Option<ReviewEdge> {
+        self.repo.current_edge()
     }
 
     fn request_or_confirm_quit(&mut self) {
@@ -990,24 +1073,62 @@ impl App {
     fn render(&mut self, frame: &mut Frame) {
         let root = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(1), Constraint::Length(FOOTER_HEIGHT)])
+            .constraints(if self.stack_review.is_some() {
+                vec![
+                    Constraint::Length(STACK_HEADER_HEIGHT),
+                    Constraint::Min(1),
+                    Constraint::Length(FOOTER_HEIGHT),
+                ]
+            } else {
+                vec![Constraint::Min(1), Constraint::Length(FOOTER_HEIGHT)]
+            })
             .split(frame.area());
+
+        let (body_area, footer_area) = if self.stack_review.is_some() {
+            self.render_stack_header(frame, root[0]);
+            (root[1], root[2])
+        } else {
+            (root[0], root[1])
+        };
 
         let main_chunks = if frame.area().width >= TWO_ROW_BREAKPOINT {
             Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(28), Constraint::Percentage(72)])
-                .split(root[0])
+                .split(body_area)
         } else {
             Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Percentage(32), Constraint::Percentage(68)])
-                .split(root[0])
+                .split(body_area)
         };
 
         self.render_files(frame, main_chunks[0]);
         self.render_diff(frame, main_chunks[1]);
-        self.render_footer(frame, root[1]);
+        self.render_footer(frame, footer_area);
+    }
+
+    fn render_stack_header(&self, frame: &mut Frame, area: Rect) {
+        let Some(stack) = &self.stack_review else {
+            return;
+        };
+        let current_edge = stack
+            .edges
+            .get(self.current_edge_idx)
+            .map(ReviewEdge::label)
+            .unwrap_or_default();
+        let chain = stack.chain.join(" <- ");
+        let status = format!(
+            "Stack {}  Edge {}/{}  {}",
+            chain,
+            self.current_edge_idx + 1,
+            stack.edges.len(),
+            current_edge
+        );
+        frame.render_widget(
+            Paragraph::new(status).style(Style::default().fg(Color::Rgb(231, 193, 119))),
+            area,
+        );
     }
 
     fn render_files(&mut self, frame: &mut Frame, area: Rect) {
@@ -1510,9 +1631,12 @@ impl App {
         } else if self.comment_draft.is_some() {
             Line::from("Comment mode: type to write, Enter to save, Esc to cancel")
         } else {
-            Line::from(
-                "h/l focus  j/k move  [/ ] file  / search  n/p next-prev  : line  t toggle  v select  c line  C file  E copy",
-            )
+            let help = if self.stack_review.is_some() {
+                "h/l focus  j/k move  </> edge  [/] file  / search  n/p next-prev  : line  t toggle  v select  c line  C file  E copy"
+            } else {
+                "h/l focus  j/k move  [/] file  / search  n/p next-prev  : line  t toggle  v select  c line  C file  E copy"
+            };
+            Line::from(help)
         };
 
         frame.render_widget(Paragraph::new(status), area);
@@ -2026,6 +2150,7 @@ impl App {
 
         self.annotations
             .iter()
+            .filter(|annotation| self.annotation_matches_current_edge(annotation))
             .filter(|annotation| annotation.file_path == summary.path)
             .filter(|annotation| self.annotation_matches_line(annotation, old_lineno, new_lineno))
             .collect()
@@ -2098,6 +2223,7 @@ impl App {
 
         self.annotations
             .iter()
+            .filter(|annotation| self.annotation_matches_current_edge(annotation))
             .filter(|annotation| annotation.file_path == summary.path && annotation.is_file_level())
             .collect()
     }
@@ -2105,7 +2231,16 @@ impl App {
     fn file_has_comments(&self, path: &str) -> bool {
         self.annotations
             .iter()
+            .filter(|annotation| self.annotation_matches_current_edge(annotation))
             .any(|annotation| annotation.file_path == path)
+    }
+
+    fn annotation_matches_current_edge(&self, annotation: &Annotation) -> bool {
+        match (&annotation.edge, self.current_review_edge()) {
+            (None, None) => true,
+            (Some(annotation_edge), Some(current_edge)) => annotation_edge == &current_edge,
+            _ => false,
+        }
     }
 
     fn set_notification(&mut self, message: String, kind: NotificationKind) {
@@ -2562,9 +2697,12 @@ mod tests {
             repo: GitRepo {
                 root,
                 base: "HEAD".to_string(),
+                head: None,
                 staged: false,
                 pathspecs: Vec::new(),
             },
+            stack_review: None,
+            current_edge_idx: 0,
             files,
             filtered_file_indices: vec![0],
             selected_file_view_idx: 0,
@@ -2717,6 +2855,7 @@ mod tests {
         app.annotations.push(Annotation::created_for_file(
             1,
             summary.path,
+            None,
             "note".to_string(),
         ));
 
