@@ -1196,15 +1196,20 @@ impl App {
                     } else {
                         file.path.clone()
                     };
-                    let style =
-                        if self.focus == Focus::Files && view_idx == self.selected_file_view_idx {
+                    let style = if view_idx == self.selected_file_view_idx {
+                        if self.focus == Focus::Files {
                             Style::default()
                                 .fg(Color::Black)
                                 .bg(Color::Rgb(208, 221, 255))
                                 .add_modifier(Modifier::BOLD)
                         } else {
                             Style::default()
-                        };
+                                .fg(Color::Rgb(225, 232, 244))
+                                .bg(Color::Rgb(45, 54, 70))
+                        }
+                    } else {
+                        Style::default()
+                    };
                     ListItem::new(Line::from(vec![
                         Span::styled(comment_marker, Style::default().fg(Color::Yellow)),
                         Span::styled(
