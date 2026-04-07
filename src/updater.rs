@@ -36,7 +36,13 @@ pub fn run() -> Result<()> {
         .assets
         .iter()
         .find(|asset| asset.name == target_name)
-        .ok_or_else(|| anyhow!("release {} is missing asset {}", release.tag_name, target_name))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "release {} is missing asset {}",
+                release.tag_name,
+                target_name
+            )
+        })?;
 
     let current_version_tag = format!("v{}", env!("CARGO_PKG_VERSION"));
     if release.tag_name == current_version_tag {
@@ -93,7 +99,8 @@ fn download_release_binary(client: &Client, asset: &ReleaseAsset) -> Result<Vec<
     let archive_path = temp.path().join(&asset.name);
     fs::write(&archive_path, &bytes).with_context(|| format!("failed to write {}", asset.name))?;
 
-    let file = fs::File::open(&archive_path).with_context(|| format!("failed to open {}", asset.name))?;
+    let file =
+        fs::File::open(&archive_path).with_context(|| format!("failed to open {}", asset.name))?;
     let mut archive = Archive::new(GzDecoder::new(file));
     archive
         .unpack(temp.path())

@@ -2168,7 +2168,9 @@ impl App {
 
         if let Some(cache) = self.whole_file_highlight_cache.get_mut(&path) {
             if !cache.lines.contains_key(&line_idx) {
-                cache.line_order.retain(|cached_idx| *cached_idx != line_idx);
+                cache
+                    .line_order
+                    .retain(|cached_idx| *cached_idx != line_idx);
                 cache.line_order.push_back(line_idx);
             }
             cache.lines.insert(line_idx, segments.clone());
@@ -3035,9 +3037,10 @@ mod tests {
 
         assert_eq!(app.patch_cache.len(), PATCH_CACHE_LIMIT);
         assert!(!app.patch_cache.contains_key("src/0.rs"));
-        assert!(app
-            .patch_cache
-            .contains_key(&format!("src/{}.rs", PATCH_CACHE_LIMIT + 3)));
+        assert!(
+            app.patch_cache
+                .contains_key(&format!("src/{}.rs", PATCH_CACHE_LIMIT + 3))
+        );
     }
 
     #[test]
@@ -3065,10 +3068,7 @@ mod tests {
         }
 
         assert_eq!(app.whole_file_cache.len(), WHOLE_FILE_CACHE_LIMIT);
-        assert_eq!(
-            app.whole_file_highlight_cache.len(),
-            WHOLE_FILE_CACHE_LIMIT
-        );
+        assert_eq!(app.whole_file_highlight_cache.len(), WHOLE_FILE_CACHE_LIMIT);
         assert!(!app.whole_file_cache.contains_key("src/0.rs"));
         assert!(!app.whole_file_highlight_cache.contains_key("src/0.rs"));
     }
