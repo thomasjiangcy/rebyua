@@ -2038,3 +2038,305 @@ fn panel_border(active: bool) -> Style {
         Style::default().fg(Color::Rgb(70, 74, 90))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TempDirGuard {
+        path: PathBuf,
+    }
+
+    impl TempDirGuard {
+        fn new() -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after unix epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!("rebyua-tests-{unique}"));
+            fs::create_dir_all(&path).expect("temp dir should be created");
+            Self { path }
+        }
+    }
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn test_theme() -> Theme {
+        let theme_set = ThemeSet::load_defaults();
+        theme_set
+            .themes
+            .get("base16-ocean.dark")
+            .cloned()
+            .or_else(|| theme_set.themes.values().next().cloned())
+            .unwrap_or_default()
+    }
+
+    fn file_summary(path: &str) -> FileSummary {
+        FileSummary {
+            path: path.to_string(),
+            old_path: None,
+            added: Some(1),
+            deleted: Some(1),
+            change: ChangeKind::Modified,
+        }
+    }
+
+    fn sample_patch(summary: &FileSummary) -> FilePatch {
+        FilePatch {
+            summary: summary.clone(),
+            metadata: Vec::new(),
+            hunks: vec![crate::model::PatchHunk {
+                header: "@@ -1,4 +1,4 @@ fn main() {".to_string(),
+                new_start: 1,
+                lines: vec![
+                    PatchLine {
+                        kind: DiffKind::Context,
+                        old_lineno: Some(1),
+                        new_lineno: Some(1),
+                        text: "fn main() {".to_string(),
+                    },
+                    PatchLine {
+                        kind: DiffKind::Delete,
+                        old_lineno: Some(2),
+                        new_lineno: None,
+                        text: "    let value = 1;".to_string(),
+                    },
+                    PatchLine {
+                        kind: DiffKind::Add,
+                        old_lineno: None,
+                        new_lineno: Some(2),
+                        text: "    let value = 2;".to_string(),
+                    },
+                    PatchLine {
+                        kind: DiffKind::Context,
+                        old_lineno: Some(3),
+                        new_lineno: Some(3),
+                        text: "    println!(\"{}\", value);".to_string(),
+                    },
+                    PatchLine {
+                        kind: DiffKind::Context,
+                        old_lineno: Some(4),
+                        new_lineno: Some(4),
+                        text: "}".to_string(),
+                    },
+                ],
+            }],
+        }
+    }
+
+    fn sample_file_text() -> &'static str {
+        "fn main() {\n    let value = 2;\n    println!(\"{}\", value);\n}\n"
+    }
+
+    fn test_app(root: PathBuf, files: Vec<FileSummary>) -> App {
+        App {
+            repo: GitRepo {
+                root,
+                base: "HEAD".to_string(),
+                staged: false,
+                pathspecs: Vec::new(),
+            },
+            files,
+            filtered_file_indices: vec![0],
+            selected_file_view_idx: 0,
+            focus: Focus::Diff,
+            view_mode: DiffViewMode::Patch,
+            patch_cache: HashMap::new(),
+            whole_file_cache: HashMap::new(),
+            whole_file_highlight_cache: HashMap::new(),
+            diff_cursor: 0,
+            diff_scroll: 0,
+            selection: None,
+            comment_draft: None,
+            expanded_comment_line: None,
+            filter_input: None,
+            filter_query: String::new(),
+            annotations: Vec::new(),
+            next_annotation_id: 1,
+            notification: None,
+            pending_quit_confirmation: false,
+            should_quit: false,
+            last_diff_inner_height: 20,
+            syntax_set: SyntaxSet::load_defaults_newlines(),
+            syntax_theme: test_theme(),
+        }
+    }
+
+    fn seed_patch(app: &mut App) {
+        let summary = app
+            .selected_file_summary()
+            .expect("selected file should exist")
+            .clone();
+        let patch = app.highlight_patch(sample_patch(&summary));
+        app.patch_cache.insert(summary.path.clone(), patch);
+    }
+
+    fn key_char(ch: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn selection_lock_stops_following_cursor() {
+        let temp = TempDirGuard::new();
+        let summary = file_summary("src/demo.rs");
+        let mut app = test_app(temp.path.clone(), vec![summary]);
+        seed_patch(&mut app);
+        app.diff_cursor = 1;
+
+        app.on_key(key_char('v')).expect("selection should start");
+        assert_eq!(
+            app.selection
+                .map(|selection| (selection.anchor, selection.cursor, selection.locked)),
+            Some((1, 1, false))
+        );
+
+        app.on_key(key_char('j'))
+            .expect("cursor should move while selecting");
+        assert_eq!(app.diff_cursor, 2);
+        assert_eq!(
+            app.selection
+                .map(|selection| (selection.anchor, selection.cursor, selection.locked)),
+            Some((1, 2, false))
+        );
+
+        app.on_key(key_char('v')).expect("selection should lock");
+        assert_eq!(
+            app.selection
+                .map(|selection| (selection.anchor, selection.cursor, selection.locked)),
+            Some((1, 2, true))
+        );
+
+        app.on_key(key_char('j'))
+            .expect("cursor should still move after locking");
+        assert_eq!(app.diff_cursor, 3);
+        assert_eq!(
+            app.selection
+                .map(|selection| (selection.anchor, selection.cursor, selection.locked)),
+            Some((1, 2, true))
+        );
+    }
+
+    #[test]
+    fn saves_line_comment_from_current_selection() {
+        let temp = TempDirGuard::new();
+        let summary = file_summary("src/demo.rs");
+        let mut app = test_app(temp.path.clone(), vec![summary.clone()]);
+        seed_patch(&mut app);
+        app.diff_cursor = 2;
+
+        app.on_key(key_char('c'))
+            .expect("line comment draft should open");
+        for ch in "tighten branch".chars() {
+            app.on_key(key_char(ch))
+                .expect("comment draft input should be accepted");
+        }
+        app.on_key(key(KeyCode::Enter))
+            .expect("comment should be saved");
+
+        assert!(app.comment_draft.is_none());
+        assert_eq!(app.annotations.len(), 1);
+        let annotation = &app.annotations[0];
+        assert_eq!(annotation.file_path, summary.path);
+        assert_eq!(annotation.body, "tighten branch");
+        assert_eq!(annotation.line_range(), Some((2, 2)));
+        let (start_ref, end_ref) = annotation.line_refs().expect("line refs should exist");
+        assert_eq!(start_ref.old_lineno, None);
+        assert_eq!(start_ref.new_lineno, Some(2));
+        assert_eq!(end_ref.old_lineno, None);
+        assert_eq!(end_ref.new_lineno, Some(2));
+    }
+
+    #[test]
+    fn saves_file_level_comment() {
+        let temp = TempDirGuard::new();
+        let summary = file_summary("src/demo.rs");
+        let mut app = test_app(temp.path.clone(), vec![summary.clone()]);
+        seed_patch(&mut app);
+
+        app.on_key(key_char('C'))
+            .expect("file comment draft should open");
+        for ch in "needs broader cleanup".chars() {
+            app.on_key(key_char(ch))
+                .expect("file comment input should be accepted");
+        }
+        app.on_key(key(KeyCode::Enter))
+            .expect("file comment should save");
+
+        assert_eq!(app.annotations.len(), 1);
+        let annotation = &app.annotations[0];
+        assert_eq!(annotation.file_path, summary.path);
+        assert!(annotation.is_file_level());
+        assert_eq!(annotation.body, "needs broader cleanup");
+    }
+
+    #[test]
+    fn quit_requires_confirmation_when_comments_exist() {
+        let temp = TempDirGuard::new();
+        let summary = file_summary("src/demo.rs");
+        let mut app = test_app(temp.path.clone(), vec![summary.clone()]);
+        seed_patch(&mut app);
+        app.annotations.push(Annotation::created_for_file(
+            1,
+            summary.path,
+            "note".to_string(),
+        ));
+
+        app.on_key(key_char('q'))
+            .expect("first quit should warn instead of exiting");
+        assert!(app.pending_quit_confirmation);
+        assert!(!app.should_quit);
+
+        app.on_key(key_char('j'))
+            .expect("normal input should clear pending confirmation");
+        assert!(!app.pending_quit_confirmation);
+
+        app.on_key(key_char('q'))
+            .expect("warning should reappear on next quit");
+        app.on_key(key_char('q')).expect("second quit should exit");
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn toggle_view_mode_preserves_cursor_location_between_patch_and_file_views() {
+        let temp = TempDirGuard::new();
+        let summary = file_summary("src/demo.rs");
+        let full_path = temp.path.join(&summary.path);
+        fs::create_dir_all(full_path.parent().expect("parent should exist"))
+            .expect("parent directories should be created");
+        fs::write(&full_path, sample_file_text()).expect("sample file should be written");
+
+        let mut app = test_app(temp.path.clone(), vec![summary.clone()]);
+        seed_patch(&mut app);
+        app.diff_cursor = 2;
+
+        app.on_key(key_char('t'))
+            .expect("toggle to whole-file view should succeed");
+        assert_eq!(app.view_mode, DiffViewMode::File);
+        assert_eq!(app.diff_cursor, 2);
+
+        let line = &app
+            .current_whole_file()
+            .expect("whole-file view should be cached")
+            .lines[app.diff_cursor];
+        assert_eq!(line.old_lineno, None);
+        assert_eq!(line.new_lineno, Some(2));
+        assert_eq!(line.text, "    let value = 2;");
+
+        app.on_key(key_char('t'))
+            .expect("toggle back to patch view should succeed");
+        assert_eq!(app.view_mode, DiffViewMode::Patch);
+        assert_eq!(app.diff_cursor, 2);
+    }
+}

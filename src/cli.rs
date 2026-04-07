@@ -47,3 +47,53 @@ pub fn run() -> Result<()> {
         None => app::run(ReviewArgs::default()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parses_empty_invocation_as_default_review() {
+        let cli = Cli::try_parse_from(["rebyua"]).expect("cli should parse");
+
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn parses_review_with_default_flags() {
+        let cli = Cli::try_parse_from(["rebyua", "review"]).expect("cli should parse");
+
+        let Some(Commands::Review(args)) = cli.command else {
+            panic!("expected review command");
+        };
+
+        assert_eq!(args.base, "HEAD");
+        assert!(args.path.is_empty());
+        assert!(!args.staged);
+    }
+
+    #[test]
+    fn parses_review_flags() {
+        let cli = Cli::try_parse_from([
+            "rebyua",
+            "review",
+            "--base",
+            "HEAD~2",
+            "--path",
+            "src/app.rs",
+            "--path",
+            "src/cli.rs",
+            "--staged",
+        ])
+        .expect("cli should parse");
+
+        let Some(Commands::Review(args)) = cli.command else {
+            panic!("expected review command");
+        };
+
+        assert_eq!(args.base, "HEAD~2");
+        assert_eq!(args.path, vec!["src/app.rs", "src/cli.rs"]);
+        assert!(args.staged);
+    }
+}

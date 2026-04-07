@@ -91,3 +91,85 @@ fn range_part(
 fn trim_hunk_header(header: &str) -> &str {
     header.trim().trim_matches('@').trim()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Annotation, AnnotationLineRange, ChangeKind, FileSummary};
+
+    fn file(path: &str) -> FileSummary {
+        FileSummary {
+            path: path.to_string(),
+            old_path: None,
+            added: Some(0),
+            deleted: Some(0),
+            change: ChangeKind::Modified,
+        }
+    }
+
+    #[test]
+    fn renders_empty_review_markdown() {
+        let output = markdown("HEAD", &[file("src/app.rs")], &[]);
+
+        assert!(output.contains("# rebyua review"));
+        assert!(output.contains("- Base: `HEAD`"));
+        assert!(output.contains("- Comments: 0"));
+        assert!(output.contains("No comments."));
+    }
+
+    #[test]
+    fn renders_file_and_line_comments_grouped_by_file() {
+        let files = vec![file("src/app.rs"), file("src/cli.rs")];
+        let annotations = vec![
+            Annotation::created_for_file(1, "src/app.rs".to_string(), "Needs more context".into()),
+            Annotation::created_for_lines(
+                2,
+                "src/app.rs".to_string(),
+                Some("@@ -10,2 +10,3 @@ fn run() {".to_string()),
+                AnnotationLineRange {
+                    start_line_idx: 4,
+                    end_line_idx: 5,
+                    start_ref: LineReference {
+                        old_lineno: Some(10),
+                        new_lineno: Some(10),
+                    },
+                    end_ref: LineReference {
+                        old_lineno: Some(11),
+                        new_lineno: Some(12),
+                    },
+                },
+                "Split this branch".into(),
+            ),
+            Annotation::created_for_lines(
+                3,
+                "src/cli.rs".to_string(),
+                None,
+                AnnotationLineRange {
+                    start_line_idx: 0,
+                    end_line_idx: 0,
+                    start_ref: LineReference {
+                        old_lineno: None,
+                        new_lineno: Some(1),
+                    },
+                    end_ref: LineReference {
+                        old_lineno: None,
+                        new_lineno: Some(1),
+                    },
+                },
+                "Looks good".into(),
+            ),
+        ];
+
+        let output = markdown("HEAD~1", &files, &annotations);
+
+        assert!(output.contains("## src/app.rs"));
+        assert!(output.contains("- file: Needs more context"));
+        assert!(
+            output.contains(
+                "- old 10-11; new 10-12 (`-10,2 +10,3 @@ fn run() {`): Split this branch"
+            )
+        );
+        assert!(output.contains("## src/cli.rs"));
+        assert!(output.contains("- new 1: Looks good"));
+    }
+}

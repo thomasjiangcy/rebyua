@@ -321,3 +321,100 @@ fn should_keep_metadata(line: &str) -> bool {
         || line.starts_with("Binary files ")
         || line.starts_with("GIT binary patch")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn summary(path: &str) -> FileSummary {
+        FileSummary {
+            path: path.to_string(),
+            old_path: None,
+            added: Some(0),
+            deleted: Some(0),
+            change: ChangeKind::Modified,
+        }
+    }
+
+    #[test]
+    fn parses_name_status_rows_with_rename() {
+        let rows = parse_name_status("M\tsrc/app.rs\nR100\told.rs\tnew.rs\n");
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0],
+            (ChangeKind::Modified, None, "src/app.rs".to_string())
+        );
+        assert_eq!(
+            rows[1],
+            (
+                ChangeKind::Renamed,
+                Some("old.rs".to_string()),
+                "new.rs".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn parses_numstat_rows_and_binary_markers() {
+        let rows = parse_numstat("12\t3\tsrc/app.rs\n-\t-\tassets/logo.png\n");
+
+        assert_eq!(rows, vec![(Some(12), Some(3)), (None, None)]);
+    }
+
+    #[test]
+    fn parses_patch_hunks_and_line_numbers() {
+        let patch = parse_patch(
+            summary("src/app.rs"),
+            "\
+diff --git a/src/app.rs b/src/app.rs
+index 1111111..2222222 100644
+--- a/src/app.rs
++++ b/src/app.rs
+@@ -2,3 +2,4 @@ fn main() {
+ context
+-removed
++added
+ unchanged
+}
+",
+        )
+        .expect("patch should parse");
+
+        assert_eq!(patch.hunks.len(), 1);
+        let hunk = &patch.hunks[0];
+        assert_eq!(hunk.header, "@@ -2,3 +2,4 @@ fn main() {");
+        assert_eq!(hunk.new_start, 2);
+        assert_eq!(hunk.lines.len(), 4);
+
+        assert_eq!(hunk.lines[0].kind, DiffKind::Context);
+        assert_eq!(hunk.lines[0].old_lineno, Some(2));
+        assert_eq!(hunk.lines[0].new_lineno, Some(2));
+
+        assert_eq!(hunk.lines[1].kind, DiffKind::Delete);
+        assert_eq!(hunk.lines[1].old_lineno, Some(3));
+        assert_eq!(hunk.lines[1].new_lineno, None);
+
+        assert_eq!(hunk.lines[2].kind, DiffKind::Add);
+        assert_eq!(hunk.lines[2].old_lineno, None);
+        assert_eq!(hunk.lines[2].new_lineno, Some(3));
+    }
+
+    #[test]
+    fn falls_back_to_rename_metadata_without_textual_patch() {
+        let patch = parse_patch(
+            FileSummary {
+                path: "new.rs".to_string(),
+                old_path: Some("old.rs".to_string()),
+                added: Some(0),
+                deleted: Some(0),
+                change: ChangeKind::Renamed,
+            },
+            "",
+        )
+        .expect("patch should parse");
+
+        assert!(patch.hunks.is_empty());
+        assert_eq!(patch.metadata, vec!["Renamed: old.rs -> new.rs"]);
+    }
+}
