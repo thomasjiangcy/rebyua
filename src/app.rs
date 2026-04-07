@@ -171,6 +171,7 @@ struct App {
     next_annotation_id: u64,
     notification: Option<Notification>,
     pending_quit_confirmation: bool,
+    pending_g_prefix: bool,
     should_quit: bool,
     last_files_inner_height: u16,
     last_diff_inner_height: u16,
@@ -211,6 +212,7 @@ impl App {
             next_annotation_id: 1,
             notification: None,
             pending_quit_confirmation: false,
+            pending_g_prefix: false,
             should_quit: false,
             last_files_inner_height: 0,
             last_diff_inner_height: 0,
@@ -235,6 +237,14 @@ impl App {
             return Ok(());
         }
 
+        let handled_gg = self.handle_jump_prefix(key);
+        if handled_gg {
+            if !matches!(key.code, KeyCode::Char('q')) {
+                self.pending_quit_confirmation = false;
+            }
+            return Ok(());
+        }
+
         match key.code {
             KeyCode::Char('q') => self.request_or_confirm_quit(),
             KeyCode::Char('h') => self.focus = Focus::Files,
@@ -250,7 +260,6 @@ impl App {
             KeyCode::Char('k') => self.move_up(),
             KeyCode::Char('J') => self.move_hunk(1),
             KeyCode::Char('K') => self.move_hunk(-1),
-            KeyCode::Char('g') => self.jump_first(),
             KeyCode::Char('G') => self.jump_last(),
             KeyCode::Char('v') => self.toggle_selection(),
             KeyCode::Char('c') => self.open_comment_draft(),
@@ -268,6 +277,25 @@ impl App {
         }
 
         Ok(())
+    }
+
+    fn handle_jump_prefix(&mut self, key: KeyEvent) -> bool {
+        if self.pending_g_prefix {
+            if matches!(key.code, KeyCode::Char('g')) {
+                self.jump_first();
+                self.pending_g_prefix = false;
+                return true;
+            }
+
+            self.pending_g_prefix = false;
+        }
+
+        if matches!(key.code, KeyCode::Char('g')) {
+            self.pending_g_prefix = true;
+            return true;
+        }
+
+        false
     }
 
     fn handle_filter_input(&mut self, key: KeyEvent) -> bool {
@@ -2295,6 +2323,7 @@ mod tests {
             next_annotation_id: 1,
             notification: None,
             pending_quit_confirmation: false,
+            pending_g_prefix: false,
             should_quit: false,
             last_files_inner_height: 0,
             last_diff_inner_height: 20,
@@ -2493,6 +2522,44 @@ mod tests {
         app.on_key(key_char('k'))
             .expect("moving up from the first file should wrap");
         assert_eq!(app.selected_file_view_idx, 2);
+    }
+
+    #[test]
+    fn gg_jumps_to_top_but_single_g_waits_for_second_key() {
+        let temp = TempDirGuard::new();
+        let summary = file_summary("src/demo.rs");
+        let mut app = test_app(temp.path.clone(), vec![summary]);
+        seed_patch(&mut app);
+        app.focus = Focus::Diff;
+        app.diff_cursor = 3;
+
+        app.on_key(key_char('g'))
+            .expect("first g should arm the prefix");
+        assert_eq!(app.diff_cursor, 3);
+        assert!(app.pending_g_prefix);
+
+        app.on_key(key_char('g'))
+            .expect("second g should jump to top");
+        assert_eq!(app.diff_cursor, 0);
+        assert!(!app.pending_g_prefix);
+    }
+
+    #[test]
+    fn gg_prefix_cancels_on_other_keys() {
+        let temp = TempDirGuard::new();
+        let summary = file_summary("src/demo.rs");
+        let mut app = test_app(temp.path.clone(), vec![summary]);
+        seed_patch(&mut app);
+        app.focus = Focus::Diff;
+        app.diff_cursor = 3;
+
+        app.on_key(key_char('g'))
+            .expect("first g should arm the prefix");
+        app.on_key(key_char('j'))
+            .expect("other keys should cancel the prefix and still work");
+
+        assert_eq!(app.diff_cursor, 4);
+        assert!(!app.pending_g_prefix);
     }
 
     #[test]
