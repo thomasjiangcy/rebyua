@@ -222,10 +222,7 @@ impl App {
 
         let mut app = Self {
             repo,
-            current_edge_idx: stack_review
-                .as_ref()
-                .map(|stack| stack.edges.len().saturating_sub(1))
-                .unwrap_or(0),
+            current_edge_idx: 0,
             stack_review,
             files,
             filtered_file_indices: Vec::new(),
@@ -1117,16 +1114,24 @@ impl App {
             .get(self.current_edge_idx)
             .map(ReviewEdge::label)
             .unwrap_or_default();
-        let chain = stack.chain.join(" <- ");
-        let status = format!(
-            "Stack {}  Edge {}/{}  {}",
-            chain,
-            self.current_edge_idx + 1,
-            stack.edges.len(),
-            current_edge
-        );
+        let progress = format!("Stack {}/{}", self.current_edge_idx + 1, stack.edges.len());
+        let leaf = format!("Leaf {}", stack.leaf_branch);
+        let reserved = progress.chars().count() + leaf.chars().count() + 4;
+        let edge_width = (area.width as usize).saturating_sub(reserved).max(12);
+        let edge_label = truncate_middle(&current_edge, edge_width);
         frame.render_widget(
-            Paragraph::new(status).style(Style::default().fg(Color::Rgb(231, 193, 119))),
+            Paragraph::new(Line::from(vec![
+                Span::styled(progress, Style::default().fg(Color::Rgb(160, 196, 255))),
+                Span::raw("  "),
+                Span::styled(
+                    edge_label,
+                    Style::default()
+                        .fg(Color::Rgb(231, 193, 119))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled(leaf, Style::default().fg(Color::Rgb(133, 146, 178))),
+            ])),
             area,
         );
     }
@@ -2453,6 +2458,31 @@ enum DiffItemKind {
 
 fn file_comments_height(comment_count: usize) -> u16 {
     (comment_count as u16 + 2).clamp(3, 6)
+}
+
+fn truncate_middle(input: &str, max_width: usize) -> String {
+    let len = input.chars().count();
+    if len <= max_width {
+        return input.to_string();
+    }
+
+    if max_width <= 3 {
+        return ".".repeat(max_width);
+    }
+
+    let keep = max_width - 3;
+    let left = keep / 2;
+    let right = keep - left;
+    let start: String = input.chars().take(left).collect();
+    let end: String = input
+        .chars()
+        .rev()
+        .take(right)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    format!("{start}...{end}")
 }
 
 fn next_visible_item_area(
