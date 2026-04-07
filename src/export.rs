@@ -2,7 +2,6 @@ use crate::model::{Annotation, FileSummary, LineReference};
 
 pub fn markdown(base: &str, files: &[FileSummary], annotations: &[Annotation]) -> String {
     let mut out = String::new();
-    out.push_str("# rebyua review\n\n");
     out.push_str(&format!("- Base: `{base}`\n"));
     out.push_str(&format!("- Comments: {}\n\n", annotations.len()));
 
@@ -111,7 +110,7 @@ mod tests {
     fn renders_empty_review_markdown() {
         let output = markdown("HEAD", &[file("src/app.rs")], &[]);
 
-        assert!(output.contains("# rebyua review"));
+        assert!(!output.contains("# rebyua review"));
         assert!(output.contains("- Base: `HEAD`"));
         assert!(output.contains("- Comments: 0"));
         assert!(output.contains("No comments."));

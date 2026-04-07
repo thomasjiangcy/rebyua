@@ -124,10 +124,23 @@ struct CommentDraft {
     text: String,
 }
 
+#[derive(Debug, Clone)]
+struct PromptInput {
+    mode: PromptMode,
+    text: String,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum CommentTarget {
     File,
     Range(SelectionRange),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptMode {
+    FileFilter,
+    Search,
+    JumpLine,
 }
 
 #[derive(Debug, Clone)]
@@ -149,6 +162,12 @@ enum DiffViewMode {
     File,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum SearchDirection {
+    Forward,
+    Backward,
+}
+
 struct App {
     repo: GitRepo,
     files: Vec<FileSummary>,
@@ -165,7 +184,8 @@ struct App {
     selection: Option<SelectionRange>,
     comment_draft: Option<CommentDraft>,
     expanded_comment_line: Option<usize>,
-    filter_input: Option<String>,
+    prompt_input: Option<PromptInput>,
+    last_search_query: Option<String>,
     filter_query: String,
     annotations: Vec<Annotation>,
     next_annotation_id: u64,
@@ -206,7 +226,8 @@ impl App {
             selection: None,
             comment_draft: None,
             expanded_comment_line: None,
-            filter_input: None,
+            prompt_input: None,
+            last_search_query: None,
             filter_query: String::new(),
             annotations: Vec::new(),
             next_annotation_id: 1,
@@ -229,7 +250,7 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyEvent) -> Result<()> {
-        if self.handle_filter_input(key) {
+        if self.handle_prompt_input(key)? {
             return Ok(());
         }
 
@@ -254,8 +275,14 @@ impl App {
                     self.load_selected_patch();
                 }
             }
-            KeyCode::Char('n') => self.move_file_selection(1),
-            KeyCode::Char('p') => self.move_file_selection(-1),
+            KeyCode::Char(']') => self.move_file_selection(1),
+            KeyCode::Char('[') => self.move_file_selection(-1),
+            KeyCode::Char('n') if self.focus == Focus::Diff => {
+                self.repeat_last_search(SearchDirection::Forward)
+            }
+            KeyCode::Char('p') if self.focus == Focus::Diff => {
+                self.repeat_last_search(SearchDirection::Backward)
+            }
             KeyCode::Char('j') => self.move_down(),
             KeyCode::Char('k') => self.move_up(),
             KeyCode::Char('J') => self.move_hunk(1),
@@ -267,7 +294,8 @@ impl App {
             KeyCode::Char('t') => self.toggle_view_mode(),
             KeyCode::Enter if self.focus == Focus::Diff => self.inspect_current_comments(),
             KeyCode::Esc => self.clear_transient_state(),
-            KeyCode::Char('/') => self.open_filter_input(),
+            KeyCode::Char('/') => self.open_slash_prompt(),
+            KeyCode::Char(':') if self.focus == Focus::Diff => self.open_line_jump_prompt(),
             KeyCode::Char('E') => self.export_to_clipboard(),
             _ => {}
         }
@@ -298,39 +326,54 @@ impl App {
         false
     }
 
-    fn handle_filter_input(&mut self, key: KeyEvent) -> bool {
-        let Some(input) = self.filter_input.as_mut() else {
-            return false;
+    fn handle_prompt_input(&mut self, key: KeyEvent) -> Result<bool> {
+        let Some(prompt) = self.prompt_input.as_mut() else {
+            return Ok(false);
         };
 
+        let mode = prompt.mode;
+        let mut submit = false;
+        let mut cancel = false;
+
         match key.code {
-            KeyCode::Esc => {
-                self.filter_input = None;
-            }
-            KeyCode::Enter => {
-                self.filter_query = input.clone();
-                self.filter_input = None;
-                self.refresh_filtered_files();
-            }
+            KeyCode::Esc => cancel = true,
+            KeyCode::Enter => submit = true,
             KeyCode::Backspace => {
-                input.pop();
-                self.filter_query = input.clone();
-                self.refresh_filtered_files();
+                prompt.text.pop();
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                input.clear();
-                self.filter_query.clear();
-                self.refresh_filtered_files();
+                prompt.text.clear();
             }
             KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                input.push(ch);
-                self.filter_query = input.clone();
-                self.refresh_filtered_files();
+                prompt.text.push(ch);
             }
             _ => {}
         }
 
-        true
+        if mode == PromptMode::FileFilter {
+            self.filter_query = self
+                .prompt_input
+                .as_ref()
+                .map(|prompt| prompt.text.clone())
+                .unwrap_or_default();
+            self.refresh_filtered_files();
+        }
+
+        if cancel {
+            self.prompt_input = None;
+            return Ok(true);
+        }
+
+        if submit {
+            match mode {
+                PromptMode::FileFilter => {}
+                PromptMode::Search => self.submit_search_prompt(),
+                PromptMode::JumpLine => self.submit_line_jump_prompt(),
+            }
+            self.prompt_input = None;
+        }
+
+        Ok(true)
     }
 
     fn handle_comment_input(&mut self, key: KeyEvent) -> Result<bool> {
@@ -668,8 +711,8 @@ impl App {
     fn clear_transient_state(&mut self) {
         if self.comment_draft.is_some() {
             self.comment_draft = None;
-        } else if self.filter_input.is_some() {
-            self.filter_input = None;
+        } else if self.prompt_input.is_some() {
+            self.prompt_input = None;
         } else if self.expanded_comment_line.is_some() {
             self.expanded_comment_line = None;
         } else {
@@ -677,9 +720,163 @@ impl App {
         }
     }
 
-    fn open_filter_input(&mut self) {
-        self.focus = Focus::Files;
-        self.filter_input = Some(self.filter_query.clone());
+    fn open_slash_prompt(&mut self) {
+        if self.focus == Focus::Diff {
+            self.prompt_input = Some(PromptInput {
+                mode: PromptMode::Search,
+                text: String::new(),
+            });
+        } else {
+            self.focus = Focus::Files;
+            self.prompt_input = Some(PromptInput {
+                mode: PromptMode::FileFilter,
+                text: self.filter_query.clone(),
+            });
+        }
+        self.pending_g_prefix = false;
+    }
+
+    fn open_line_jump_prompt(&mut self) {
+        self.prompt_input = Some(PromptInput {
+            mode: PromptMode::JumpLine,
+            text: String::new(),
+        });
+        self.pending_g_prefix = false;
+    }
+
+    fn submit_search_prompt(&mut self) {
+        let query = self
+            .prompt_input
+            .as_ref()
+            .map(|prompt| prompt.text.trim().to_string())
+            .unwrap_or_default();
+        if query.is_empty() {
+            return;
+        }
+
+        self.last_search_query = Some(query.clone());
+        if !self.search_for_query(&query, SearchDirection::Forward) {
+            self.set_notification(format!("No matches for /{query}"), NotificationKind::Error);
+        }
+    }
+
+    fn submit_line_jump_prompt(&mut self) {
+        let raw = self
+            .prompt_input
+            .as_ref()
+            .map(|prompt| prompt.text.trim().to_string())
+            .unwrap_or_default();
+        let Ok(target) = raw.parse::<usize>() else {
+            self.set_notification(
+                "Line jump expects a number".to_string(),
+                NotificationKind::Error,
+            );
+            return;
+        };
+
+        if self.jump_to_line_number(target) {
+            self.ensure_cursor_visible();
+        } else {
+            self.set_notification(
+                format!("Line {target} is not present in this view"),
+                NotificationKind::Error,
+            );
+        }
+    }
+
+    fn jump_to_line_number(&mut self, target: usize) -> bool {
+        let match_line = |old_lineno: Option<usize>, new_lineno: Option<usize>| {
+            new_lineno == Some(target) || old_lineno == Some(target)
+        };
+
+        let found = match self.view_mode {
+            DiffViewMode::Patch => self.current_patch().and_then(|patch| {
+                patch
+                    .flat_lines
+                    .iter()
+                    .position(|line| match_line(line.old_lineno, line.new_lineno))
+            }),
+            DiffViewMode::File => self.current_whole_file().and_then(|file| {
+                file.lines
+                    .iter()
+                    .position(|line| match_line(line.old_lineno, line.new_lineno))
+            }),
+        };
+
+        if let Some(line_idx) = found {
+            self.diff_cursor = line_idx;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn line_text(&self, line_idx: usize) -> Option<&str> {
+        match self.view_mode {
+            DiffViewMode::Patch => self.current_patch().and_then(|patch| {
+                patch
+                    .flat_lines
+                    .get(line_idx)
+                    .map(|line| line.text.as_str())
+            }),
+            DiffViewMode::File => self
+                .current_whole_file()
+                .and_then(|file| file.lines.get(line_idx).map(|line| line.text.as_str())),
+        }
+    }
+
+    fn repeat_last_search(&mut self, direction: SearchDirection) {
+        let Some(query) = self.last_search_query.clone() else {
+            self.set_notification("No active search".to_string(), NotificationKind::Error);
+            return;
+        };
+
+        if !self.search_for_query(&query, direction) {
+            self.set_notification(format!("No matches for /{query}"), NotificationKind::Error);
+        }
+    }
+
+    fn search_for_query(&mut self, query: &str, direction: SearchDirection) -> bool {
+        let line_count = self.current_line_count();
+        if line_count == 0 {
+            return false;
+        }
+
+        let needle = query.to_lowercase();
+        let found = match direction {
+            SearchDirection::Forward => {
+                let start = (self.diff_cursor + 1) % line_count;
+                (0..line_count)
+                    .map(|offset| (start + offset) % line_count)
+                    .find(|idx| {
+                        self.line_text(*idx)
+                            .map(|text| text.to_lowercase().contains(&needle))
+                            .unwrap_or(false)
+                    })
+            }
+            SearchDirection::Backward => {
+                let start = if self.diff_cursor == 0 {
+                    line_count - 1
+                } else {
+                    self.diff_cursor - 1
+                };
+                (0..line_count)
+                    .map(|offset| (start + line_count - offset) % line_count)
+                    .find(|idx| {
+                        self.line_text(*idx)
+                            .map(|text| text.to_lowercase().contains(&needle))
+                            .unwrap_or(false)
+                    })
+            }
+        };
+
+        if let Some(found_idx) = found {
+            self.diff_cursor = found_idx;
+            self.ensure_cursor_visible();
+            true
+        } else {
+            false
+        }
     }
 
     fn export_to_clipboard(&mut self) {
@@ -805,8 +1002,14 @@ impl App {
     }
 
     fn render_files(&mut self, frame: &mut Frame, area: Rect) {
-        let title = if let Some(filter_input) = &self.filter_input {
-            format!(" Files /{} ", filter_input)
+        let title = if let Some(prompt) = &self.prompt_input {
+            if prompt.mode == PromptMode::FileFilter {
+                format!(" Files /{} ", prompt.text)
+            } else if self.filter_query.is_empty() {
+                " Files ".to_string()
+            } else {
+                format!(" Files ({}) ", self.filter_query)
+            }
         } else if self.filter_query.is_empty() {
             " Files ".to_string()
         } else {
@@ -1285,16 +1488,21 @@ impl App {
                 notification.message.clone(),
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             )])
-        } else if let Some(filter) = &self.filter_input {
+        } else if let Some(prompt) = &self.prompt_input {
+            let label = match prompt.mode {
+                PromptMode::FileFilter => format!("Filtering: {}", prompt.text),
+                PromptMode::Search => format!("Search: /{}", prompt.text),
+                PromptMode::JumpLine => format!("Jump: :{}", prompt.text),
+            };
             Line::from(vec![Span::styled(
-                format!("Filtering: {filter}"),
+                label,
                 Style::default().fg(Color::Rgb(160, 196, 255)),
             )])
         } else if self.comment_draft.is_some() {
             Line::from("Comment mode: type to write, Enter to save, Esc to cancel")
         } else {
             Line::from(
-                "h/l focus  j/k move  n/p file  t toggle  v select  c line  C file  Enter inspect  E copy",
+                "h/l focus  j/k move  [/ ] file  / search  n/p next-prev  : line  t toggle  v select  c line  C file  E copy",
             )
         };
 
@@ -2317,7 +2525,8 @@ mod tests {
             selection: None,
             comment_draft: None,
             expanded_comment_line: None,
-            filter_input: None,
+            prompt_input: None,
+            last_search_query: None,
             filter_query: String::new(),
             annotations: Vec::new(),
             next_annotation_id: 1,
@@ -2563,7 +2772,104 @@ mod tests {
     }
 
     #[test]
-    fn next_and_previous_file_hotkeys_work_from_diff_focus() {
+    fn slash_search_in_diff_focus_moves_to_next_matching_line() {
+        let temp = TempDirGuard::new();
+        let summary = file_summary("src/demo.rs");
+        let mut app = test_app(temp.path.clone(), vec![summary]);
+        seed_patch(&mut app);
+        app.focus = Focus::Diff;
+        app.diff_cursor = 0;
+
+        app.on_key(key_char('/'))
+            .expect("search prompt should open");
+        for ch in "PRINTLN".chars() {
+            app.on_key(key_char(ch))
+                .expect("search input should be accepted");
+        }
+        app.on_key(key(KeyCode::Enter))
+            .expect("search should submit");
+
+        assert!(app.prompt_input.is_none());
+        assert_eq!(app.diff_cursor, 3);
+    }
+
+    #[test]
+    fn slash_in_file_focus_keeps_file_filter_behavior() {
+        let temp = TempDirGuard::new();
+        let files = vec![file_summary("src/one.rs"), file_summary("tests/two.rs")];
+        let mut app = test_app(temp.path.clone(), files);
+        app.focus = Focus::Files;
+        app.filtered_file_indices = vec![0, 1];
+
+        app.on_key(key_char('/'))
+            .expect("file filter prompt should open");
+        for ch in "tests".chars() {
+            app.on_key(key_char(ch))
+                .expect("filter input should be accepted");
+        }
+
+        assert_eq!(app.filter_query, "tests");
+        assert_eq!(app.filtered_file_indices, vec![1]);
+    }
+
+    #[test]
+    fn line_jump_moves_to_matching_diff_line() {
+        let temp = TempDirGuard::new();
+        let summary = file_summary("src/demo.rs");
+        let mut app = test_app(temp.path.clone(), vec![summary]);
+        seed_patch(&mut app);
+        app.focus = Focus::Diff;
+        app.diff_cursor = 0;
+
+        app.on_key(key_char(':'))
+            .expect("line jump prompt should open");
+        app.on_key(key_char('3'))
+            .expect("line number input should be accepted");
+        app.on_key(key(KeyCode::Enter))
+            .expect("line jump should submit");
+
+        assert!(app.prompt_input.is_none());
+        assert_eq!(app.diff_cursor, 3);
+    }
+
+    #[test]
+    fn n_and_p_repeat_last_search_in_both_directions() {
+        let temp = TempDirGuard::new();
+        let summary = file_summary("src/demo.rs");
+        let mut app = test_app(temp.path.clone(), vec![summary]);
+        seed_patch(&mut app);
+        app.focus = Focus::Diff;
+        app.diff_cursor = 0;
+
+        app.on_key(key_char('/'))
+            .expect("search prompt should open");
+        for ch in "value".chars() {
+            app.on_key(key_char(ch))
+                .expect("search input should be accepted");
+        }
+        app.on_key(key(KeyCode::Enter))
+            .expect("search should submit");
+        assert_eq!(app.diff_cursor, 1);
+
+        app.on_key(key_char('n'))
+            .expect("n should jump to the next match");
+        assert_eq!(app.diff_cursor, 2);
+
+        app.on_key(key_char('n'))
+            .expect("n should jump to the third match");
+        assert_eq!(app.diff_cursor, 3);
+
+        app.on_key(key_char('n'))
+            .expect("n should wrap around to the first match");
+        assert_eq!(app.diff_cursor, 1);
+
+        app.on_key(key_char('p'))
+            .expect("p should jump to the previous match");
+        assert_eq!(app.diff_cursor, 3);
+    }
+
+    #[test]
+    fn bracket_file_hotkeys_work_from_diff_focus() {
         let temp = TempDirGuard::new();
         let files = vec![
             file_summary("src/one.rs"),
@@ -2575,16 +2881,16 @@ mod tests {
         app.filtered_file_indices = vec![0, 1, 2];
         app.selected_file_view_idx = 0;
 
-        app.on_key(key_char('n'))
-            .expect("n should move to the next file");
+        app.on_key(key_char(']'))
+            .expect("] should move to the next file");
         assert_eq!(app.selected_file_view_idx, 1);
 
-        app.on_key(key_char('p'))
-            .expect("p should move to the previous file");
+        app.on_key(key_char('['))
+            .expect("[ should move to the previous file");
         assert_eq!(app.selected_file_view_idx, 0);
 
-        app.on_key(key_char('p'))
-            .expect("p should wrap to the last file");
+        app.on_key(key_char('['))
+            .expect("[ should wrap to the last file");
         assert_eq!(app.selected_file_view_idx, 2);
     }
 
