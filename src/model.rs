@@ -36,6 +36,7 @@ pub struct PatchLine {
 #[derive(Debug, Clone)]
 pub struct PatchHunk {
     pub header: String,
+    pub new_start: usize,
     pub lines: Vec<PatchLine>,
 }
 

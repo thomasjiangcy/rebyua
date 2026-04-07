@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -22,8 +23,8 @@ use crate::clipboard;
 use crate::export;
 use crate::git::GitRepo;
 use crate::model::{
-    Annotation, AnnotationLineRange, AnnotationScope, ChangeKind, DiffKind, FilePatch, FileSummary,
-    Focus, LineReference, PatchLine, SelectionRange,
+    Annotation, AnnotationLineRange, ChangeKind, DiffKind, FilePatch, FileSummary, Focus,
+    LineReference, PatchLine, SelectionRange,
 };
 
 const NOTIFICATION_TTL: Duration = Duration::from_secs(3);
@@ -91,6 +92,22 @@ struct HighlightedPatch {
 }
 
 #[derive(Debug, Clone)]
+struct WholeFileRender {
+    lines: Vec<WholeFileLine>,
+    hunk_starts: Vec<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct WholeFileLine {
+    old_lineno: Option<usize>,
+    new_lineno: Option<usize>,
+    text: String,
+    diff_kind: Option<DiffKind>,
+    hunk_header: Option<String>,
+    highlights: Vec<StyledSegment>,
+}
+
+#[derive(Debug, Clone)]
 struct StyledSegment {
     text: String,
     style: Style,
@@ -121,13 +138,21 @@ enum NotificationKind {
     Error,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffViewMode {
+    Patch,
+    File,
+}
+
 struct App {
     repo: GitRepo,
     files: Vec<FileSummary>,
     filtered_file_indices: Vec<usize>,
     selected_file_view_idx: usize,
     focus: Focus,
+    view_mode: DiffViewMode,
     patch_cache: HashMap<String, HighlightedPatch>,
+    whole_file_cache: HashMap<String, WholeFileRender>,
     diff_cursor: usize,
     diff_scroll: usize,
     selection: Option<SelectionRange>,
@@ -162,7 +187,9 @@ impl App {
             filtered_file_indices: Vec::new(),
             selected_file_view_idx: 0,
             focus: Focus::Files,
+            view_mode: DiffViewMode::Patch,
             patch_cache: HashMap::new(),
+            whole_file_cache: HashMap::new(),
             diff_cursor: 0,
             diff_scroll: 0,
             selection: None,
@@ -215,6 +242,7 @@ impl App {
             KeyCode::Char('v') => self.toggle_selection(),
             KeyCode::Char('c') => self.open_comment_draft(),
             KeyCode::Char('C') => self.open_file_comment_draft(),
+            KeyCode::Char('t') => self.toggle_view_mode(),
             KeyCode::Enter if self.focus == Focus::Diff => self.inspect_current_comments(),
             KeyCode::Esc => self.clear_transient_state(),
             KeyCode::Char('/') => self.open_filter_input(),
@@ -297,10 +325,11 @@ impl App {
                 }
             }
             Focus::Diff => {
-                let Some(patch) = self.current_patch() else {
+                let line_count = self.current_line_count();
+                if line_count == 0 {
                     return;
-                };
-                if self.diff_cursor + 1 < patch.flat_lines.len() {
+                }
+                if self.diff_cursor + 1 < line_count {
                     self.diff_cursor += 1;
                     if let Some(selection) = self
                         .selection
@@ -340,23 +369,30 @@ impl App {
     }
 
     fn move_hunk(&mut self, direction: isize) {
-        let Some(patch) = self.current_patch() else {
-            return;
+        let hunk_starts = match self.view_mode {
+            DiffViewMode::Patch => self
+                .current_patch()
+                .map(|patch| patch.hunk_starts.clone())
+                .unwrap_or_default(),
+            DiffViewMode::File => self
+                .current_whole_file()
+                .map(|file| file.hunk_starts.clone())
+                .unwrap_or_default(),
         };
-        if patch.hunk_starts.is_empty() {
+        if hunk_starts.is_empty() {
             return;
         }
 
         let mut target = self.diff_cursor;
         if direction > 0 {
-            for start in &patch.hunk_starts {
+            for start in &hunk_starts {
                 if *start > self.diff_cursor {
                     target = *start;
                     break;
                 }
             }
         } else {
-            for start in patch.hunk_starts.iter().rev() {
+            for start in hunk_starts.iter().rev() {
                 if *start < self.diff_cursor {
                     target = *start;
                     break;
@@ -400,11 +436,9 @@ impl App {
                 }
             }
             Focus::Diff => {
-                let Some(patch) = self.current_patch() else {
-                    return;
-                };
-                if !patch.flat_lines.is_empty() {
-                    self.diff_cursor = patch.flat_lines.len() - 1;
+                let line_count = self.current_line_count();
+                if line_count > 0 {
+                    self.diff_cursor = line_count - 1;
                     if let Some(selection) = self
                         .selection
                         .as_mut()
@@ -440,7 +474,7 @@ impl App {
     }
 
     fn open_comment_draft(&mut self) {
-        if self.focus != Focus::Diff || self.current_patch().is_none() {
+        if self.focus != Focus::Diff || self.current_line_count() == 0 {
             return;
         }
 
@@ -479,9 +513,6 @@ impl App {
         let Some(summary) = self.selected_file_summary().cloned() else {
             return Ok(());
         };
-        let Some(patch) = self.current_patch() else {
-            return Ok(());
-        };
 
         let body = draft.text.trim();
         if body.is_empty() {
@@ -494,35 +525,69 @@ impl App {
                 summary.path.clone(),
                 body.to_string(),
             ),
-            CommentTarget::Range(range) => {
-                let (start, end) = range.normalized();
-                let start_line = patch.flat_lines.get(start).context("invalid start line")?;
-                let end_line = patch.flat_lines.get(end).context("invalid end line")?;
-                let hunk_header = patch
-                    .line_to_hunk
-                    .get(start)
-                    .and_then(|maybe_idx| maybe_idx.and_then(|idx| patch.patch.hunks.get(idx)))
-                    .map(|hunk| hunk.header.clone());
+            CommentTarget::Range(range) => match self.view_mode {
+                DiffViewMode::Patch => {
+                    let patch = self.current_patch().context("missing patch view")?;
+                    let (start, end) = range.normalized();
+                    let start_line = patch.flat_lines.get(start).context("invalid start line")?;
+                    let end_line = patch.flat_lines.get(end).context("invalid end line")?;
+                    let hunk_header = patch
+                        .line_to_hunk
+                        .get(start)
+                        .and_then(|maybe_idx| maybe_idx.and_then(|idx| patch.patch.hunks.get(idx)))
+                        .map(|hunk| hunk.header.clone());
 
-                Annotation::created_for_lines(
-                    self.next_annotation_id,
-                    summary.path.clone(),
-                    hunk_header,
-                    AnnotationLineRange {
-                        start_line_idx: start,
-                        end_line_idx: end,
-                        start_ref: LineReference {
-                            old_lineno: start_line.old_lineno,
-                            new_lineno: start_line.new_lineno,
+                    Annotation::created_for_lines(
+                        self.next_annotation_id,
+                        summary.path.clone(),
+                        hunk_header,
+                        AnnotationLineRange {
+                            start_line_idx: start,
+                            end_line_idx: end,
+                            start_ref: LineReference {
+                                old_lineno: start_line.old_lineno,
+                                new_lineno: start_line.new_lineno,
+                            },
+                            end_ref: LineReference {
+                                old_lineno: end_line.old_lineno,
+                                new_lineno: end_line.new_lineno,
+                            },
                         },
-                        end_ref: LineReference {
-                            old_lineno: end_line.old_lineno,
-                            new_lineno: end_line.new_lineno,
+                        body.to_string(),
+                    )
+                }
+                DiffViewMode::File => {
+                    let file = self
+                        .current_whole_file()
+                        .context("missing whole-file view")?;
+                    let (start, end) = range.normalized();
+                    let start_line = file.lines.get(start).context("invalid start line")?;
+                    let end_line = file.lines.get(end).context("invalid end line")?;
+                    let hunk_header = start_line
+                        .hunk_header
+                        .clone()
+                        .or_else(|| end_line.hunk_header.clone());
+
+                    Annotation::created_for_lines(
+                        self.next_annotation_id,
+                        summary.path.clone(),
+                        hunk_header,
+                        AnnotationLineRange {
+                            start_line_idx: start,
+                            end_line_idx: end,
+                            start_ref: LineReference {
+                                old_lineno: start_line.old_lineno,
+                                new_lineno: start_line.new_lineno,
+                            },
+                            end_ref: LineReference {
+                                old_lineno: end_line.old_lineno,
+                                new_lineno: end_line.new_lineno,
+                            },
                         },
-                    },
-                    body.to_string(),
-                )
-            }
+                        body.to_string(),
+                    )
+                }
+            },
         };
 
         self.annotations.push(annotation);
@@ -595,6 +660,64 @@ impl App {
             "Unsaved in-memory comments will be lost. Press q again to quit.".to_string(),
             NotificationKind::Error,
         );
+    }
+
+    fn toggle_view_mode(&mut self) {
+        let Some(path) = self
+            .selected_file_summary()
+            .map(|summary| summary.path.clone())
+        else {
+            return;
+        };
+
+        self.selection = None;
+        self.comment_draft = None;
+        self.expanded_comment_line = None;
+
+        match self.view_mode {
+            DiffViewMode::Patch => {
+                if !self.load_whole_file_for_selected() {
+                    self.set_notification(
+                        format!("Whole-file view is unavailable for {path}"),
+                        NotificationKind::Error,
+                    );
+                    return;
+                }
+
+                let current_ref = self.current_patch().and_then(|patch| {
+                    patch
+                        .flat_lines
+                        .get(self.diff_cursor)
+                        .map(|line| (line.old_lineno, line.new_lineno))
+                });
+                self.view_mode = DiffViewMode::File;
+                if let Some((old_lineno, new_lineno)) = current_ref
+                    && let Some(line_idx) = self.find_whole_file_line(old_lineno, new_lineno)
+                {
+                    self.diff_cursor = line_idx;
+                } else {
+                    self.diff_cursor = 0;
+                }
+            }
+            DiffViewMode::File => {
+                let current_ref = self.current_whole_file().and_then(|file| {
+                    file.lines
+                        .get(self.diff_cursor)
+                        .map(|line| (line.old_lineno, line.new_lineno))
+                });
+                self.view_mode = DiffViewMode::Patch;
+                if let Some((old_lineno, new_lineno)) = current_ref
+                    && let Some(line_idx) = self.find_patch_line(old_lineno, new_lineno)
+                {
+                    self.diff_cursor = line_idx;
+                } else {
+                    self.diff_cursor = 0;
+                }
+            }
+        }
+
+        self.diff_scroll = 0;
+        self.ensure_cursor_visible();
     }
 
     fn expire_notification(&mut self) {
@@ -700,7 +823,11 @@ impl App {
 
     fn render_diff(&mut self, frame: &mut Frame, area: Rect) {
         let title = if let Some(summary) = self.selected_file_summary() {
-            format!(" Diff {} ", summary.path)
+            let mode = match self.view_mode {
+                DiffViewMode::Patch => "patch",
+                DiffViewMode::File => "file",
+            };
+            format!(" Diff {} [{}] ", summary.path, mode)
         } else {
             " Diff ".to_string()
         };
@@ -713,6 +840,13 @@ impl App {
         frame.render_widget(block, area);
         self.last_diff_inner_height = inner.height;
 
+        match self.view_mode {
+            DiffViewMode::Patch => self.render_patch_view(frame, inner),
+            DiffViewMode::File => self.render_whole_file_view(frame, inner),
+        }
+    }
+
+    fn render_patch_view(&mut self, frame: &mut Frame, inner: Rect) {
         let Some(patch) = self.current_patch() else {
             let empty = Paragraph::new("Select a file to review.")
                 .style(Style::default().fg(Color::DarkGray))
@@ -742,7 +876,7 @@ impl App {
             return;
         }
 
-        let items = self.diff_items(patch);
+        let items = self.patch_items(patch);
         let mut y = 0u16;
         let mut visual_offset = 0usize;
 
@@ -783,6 +917,62 @@ impl App {
                 DiffItemKind::Editor => {
                     self.render_comment_editor(frame, row_area);
                 }
+                DiffItemKind::ExpandedComments { line_idx } => {
+                    self.render_expanded_comments(frame, row_area, line_idx);
+                }
+            }
+
+            y += render_height;
+            visual_offset += item.height as usize;
+        }
+    }
+
+    fn render_whole_file_view(&mut self, frame: &mut Frame, inner: Rect) {
+        let Some(file) = self.current_whole_file() else {
+            let empty = Paragraph::new("Whole-file view is unavailable for this selection.")
+                .style(Style::default().fg(Color::DarkGray))
+                .wrap(Wrap { trim: false });
+            frame.render_widget(empty, inner);
+            return;
+        };
+
+        let items = self.whole_file_items(file);
+        let mut y = 0u16;
+        let mut visual_offset = 0usize;
+
+        for item in items {
+            if visual_offset + item.height as usize <= self.diff_scroll {
+                visual_offset += item.height as usize;
+                continue;
+            }
+            if y >= inner.height {
+                break;
+            }
+
+            let skip_rows = self.diff_scroll.saturating_sub(visual_offset);
+            let available_height = inner.height.saturating_sub(y);
+            let render_height = item
+                .height
+                .saturating_sub(skip_rows as u16)
+                .min(available_height);
+            if render_height == 0 {
+                visual_offset += item.height as usize;
+                continue;
+            }
+
+            let row_area = Rect {
+                x: inner.x,
+                y: inner.y + y,
+                width: inner.width,
+                height: render_height,
+            };
+
+            match item.kind {
+                DiffItemKind::FileComments => self.render_file_comments(frame, row_area),
+                DiffItemKind::Line(line_idx) => {
+                    self.render_whole_file_line(frame, row_area, file, line_idx);
+                }
+                DiffItemKind::Editor => self.render_comment_editor(frame, row_area),
                 DiffItemKind::ExpandedComments { line_idx } => {
                     self.render_expanded_comments(frame, row_area, line_idx);
                 }
@@ -839,7 +1029,7 @@ impl App {
             Span::raw(" "),
             Span::styled(new, Style::default().fg(Color::DarkGray)),
             Span::raw(" "),
-            Span::styled(sign, Style::default().fg(diff_sign_color(line.kind))),
+            Span::styled(sign, Style::default().fg(diff_sign_color(Some(line.kind)))),
             Span::raw(" "),
         ];
 
@@ -849,6 +1039,67 @@ impl App {
         } else {
             for segment in highlighted {
                 spans.push(Span::styled(segment.text, segment.style));
+            }
+        }
+
+        frame.render_widget(Paragraph::new(Line::from(spans)).style(line_style), area);
+    }
+
+    fn render_whole_file_line(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        file: &WholeFileRender,
+        line_idx: usize,
+    ) {
+        let line = &file.lines[line_idx];
+        let in_selection = self
+            .selected_range()
+            .map(|(start, end)| line_idx >= start && line_idx <= end)
+            .unwrap_or(false);
+        let has_comments = self.line_has_comments(line_idx);
+        let selected = self.focus == Focus::Diff && line_idx == self.diff_cursor;
+
+        let base_style = whole_file_base_style(line.diff_kind);
+        let line_style = if selected {
+            base_style.bg(Color::Rgb(50, 61, 82))
+        } else if in_selection {
+            base_style.bg(Color::Rgb(32, 42, 58))
+        } else {
+            base_style
+        };
+
+        let gutter = if has_comments { "●" } else { " " };
+        let sign = match line.diff_kind {
+            Some(DiffKind::Add) => "+",
+            Some(DiffKind::Delete) => "-",
+            Some(DiffKind::Context) => "~",
+            None => " ",
+        };
+        let old = line
+            .old_lineno
+            .map(|value| format!("{value:>4}"))
+            .unwrap_or_else(|| "    ".to_string());
+        let new = line
+            .new_lineno
+            .map(|value| format!("{value:>4}"))
+            .unwrap_or_else(|| "    ".to_string());
+
+        let mut spans = vec![
+            Span::styled(format!("{gutter} "), Style::default().fg(Color::Yellow)),
+            Span::styled(old, Style::default().fg(Color::DarkGray)),
+            Span::raw(" "),
+            Span::styled(new, Style::default().fg(Color::DarkGray)),
+            Span::raw(" "),
+            Span::styled(sign, Style::default().fg(diff_sign_color(line.diff_kind))),
+            Span::raw(" "),
+        ];
+
+        if line.highlights.is_empty() {
+            spans.push(Span::raw(line.text.clone()));
+        } else {
+            for segment in &line.highlights {
+                spans.push(Span::styled(segment.text.clone(), segment.style));
             }
         }
 
@@ -964,7 +1215,7 @@ impl App {
             Line::from("Comment mode: type to write, Enter to save, Esc to cancel")
         } else {
             Line::from(
-                "h/l focus  j/k move  v select  c line  C file  Enter inspect  / filter  E copy",
+                "h/l focus  j/k move  t toggle  v select  c line  C file  Enter inspect  E copy",
             )
         };
 
@@ -1004,6 +1255,9 @@ impl App {
         self.comment_draft = None;
         self.expanded_comment_line = None;
         self.load_selected_patch();
+        if self.view_mode == DiffViewMode::File && !self.load_whole_file_for_selected() {
+            self.view_mode = DiffViewMode::Patch;
+        }
     }
 
     fn load_selected_patch(&mut self) {
@@ -1030,6 +1284,34 @@ impl App {
                     format!("Failed to load {}: {err}", summary.path),
                     NotificationKind::Error,
                 );
+            }
+        }
+    }
+
+    fn load_whole_file_for_selected(&mut self) -> bool {
+        let Some(summary) = self.selected_file_summary().cloned() else {
+            return false;
+        };
+        if self.whole_file_cache.contains_key(&summary.path) {
+            return true;
+        }
+        let Some(patch) = self.current_patch() else {
+            return false;
+        };
+
+        match self.repo.load_file_text(&summary) {
+            Ok(Some(text)) => {
+                let whole = self.highlight_whole_file(patch, &text);
+                self.whole_file_cache.insert(summary.path.clone(), whole);
+                true
+            }
+            Ok(None) => false,
+            Err(err) => {
+                self.set_notification(
+                    format!("Failed to load file {}: {err}", summary.path),
+                    NotificationKind::Error,
+                );
+                false
             }
         }
     }
@@ -1068,7 +1350,112 @@ impl App {
         }
     }
 
-    fn diff_items(&self, patch: &HighlightedPatch) -> Vec<DiffItem> {
+    fn highlight_whole_file(&self, patch: &HighlightedPatch, text: &str) -> WholeFileRender {
+        let syntax = self
+            .syntax_set
+            .find_syntax_for_file(&patch.patch.summary.path)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text());
+        let mut highlighter = HighlightLines::new(syntax, &self.syntax_theme);
+
+        let mut current_lines: Vec<WholeFileLine> = text
+            .lines()
+            .enumerate()
+            .map(|(idx, line)| WholeFileLine {
+                old_lineno: None,
+                new_lineno: Some(idx + 1),
+                text: line.to_string(),
+                diff_kind: None,
+                hunk_header: None,
+                highlights: highlight_line_segments(&self.syntax_set, &mut highlighter, line),
+            })
+            .collect();
+
+        let mut deleted_blocks: BTreeMap<usize, Vec<WholeFileLine>> = BTreeMap::new();
+
+        for hunk in &patch.patch.hunks {
+            let mut pending_deleted = Vec::new();
+            let mut last_insert_position = hunk.new_start.saturating_sub(1);
+
+            for line in &hunk.lines {
+                match line.kind {
+                    DiffKind::Delete => {
+                        pending_deleted.push(WholeFileLine {
+                            old_lineno: line.old_lineno,
+                            new_lineno: None,
+                            text: line.text.clone(),
+                            diff_kind: Some(DiffKind::Delete),
+                            hunk_header: Some(hunk.header.clone()),
+                            highlights: highlight_line_segments(
+                                &self.syntax_set,
+                                &mut highlighter,
+                                &line.text,
+                            ),
+                        });
+                    }
+                    DiffKind::Add | DiffKind::Context => {
+                        if let Some(new_lineno) = line.new_lineno {
+                            last_insert_position = new_lineno.saturating_sub(1);
+                            if let Some(entry) = current_lines.get_mut(new_lineno.saturating_sub(1))
+                            {
+                                entry.diff_kind = Some(line.kind);
+                                entry.hunk_header = Some(hunk.header.clone());
+                                entry.old_lineno = line.old_lineno;
+                            }
+                        }
+                        if !pending_deleted.is_empty() {
+                            deleted_blocks
+                                .entry(last_insert_position)
+                                .or_default()
+                                .append(&mut pending_deleted);
+                        }
+                    }
+                }
+            }
+
+            if !pending_deleted.is_empty() {
+                let position = if patch.patch.summary.change == ChangeKind::Deleted {
+                    0
+                } else {
+                    let hunk_end = hunk.new_start.saturating_sub(1)
+                        + hunk.lines.iter().filter_map(|line| line.new_lineno).count();
+                    hunk_end.min(current_lines.len())
+                };
+                deleted_blocks
+                    .entry(position)
+                    .or_default()
+                    .append(&mut pending_deleted);
+            }
+        }
+
+        let mut lines = Vec::new();
+        for idx in 0..=current_lines.len() {
+            if let Some(mut deleted) = deleted_blocks.remove(&idx) {
+                lines.append(&mut deleted);
+            }
+            if let Some(line) = current_lines.get(idx) {
+                lines.push(line.clone());
+            }
+        }
+
+        let mut hunk_starts = Vec::new();
+        let mut last_hunk_header: Option<String> = None;
+        for (idx, line) in lines.iter().enumerate() {
+            if let Some(header) = &line.hunk_header
+                && last_hunk_header.as_ref() != Some(header)
+            {
+                hunk_starts.push(idx);
+                last_hunk_header = Some(header.clone());
+            } else if line.hunk_header.is_none() {
+                last_hunk_header = None;
+            }
+        }
+
+        WholeFileRender { lines, hunk_starts }
+    }
+
+    fn patch_items(&self, patch: &HighlightedPatch) -> Vec<DiffItem> {
         let mut items = Vec::new();
         let file_comments_count = self.file_comments_for_selected_file().len();
         let show_file_comments = file_comments_count > 0;
@@ -1127,16 +1514,77 @@ impl App {
         items
     }
 
+    fn whole_file_items(&self, file: &WholeFileRender) -> Vec<DiffItem> {
+        let mut items = Vec::new();
+        let file_comments_count = self.file_comments_for_selected_file().len();
+        let show_file_comments = file_comments_count > 0;
+        let file_editor = matches!(
+            self.comment_draft.as_ref().map(|draft| draft.target),
+            Some(CommentTarget::File)
+        );
+        let editor_anchor = self
+            .comment_draft
+            .as_ref()
+            .and_then(|draft| match draft.target {
+                CommentTarget::File => None,
+                CommentTarget::Range(range) => Some(range.normalized().1),
+            });
+        let expanded_anchor = self.expanded_comment_line;
+
+        if show_file_comments {
+            items.push(DiffItem {
+                kind: DiffItemKind::FileComments,
+                height: file_comments_height(file_comments_count),
+            });
+        }
+        if file_editor {
+            items.push(DiffItem {
+                kind: DiffItemKind::Editor,
+                height: COMMENT_BOX_HEIGHT,
+            });
+        }
+
+        for line_idx in 0..file.lines.len() {
+            items.push(DiffItem {
+                kind: DiffItemKind::Line(line_idx),
+                height: 1,
+            });
+            if Some(line_idx) == editor_anchor {
+                items.push(DiffItem {
+                    kind: DiffItemKind::Editor,
+                    height: COMMENT_BOX_HEIGHT,
+                });
+            }
+            if Some(line_idx) == expanded_anchor {
+                items.push(DiffItem {
+                    kind: DiffItemKind::ExpandedComments { line_idx },
+                    height: COMMENT_BOX_HEIGHT,
+                });
+            }
+        }
+
+        items
+    }
+
     fn ensure_cursor_visible(&mut self) {
         let height = self.last_diff_inner_height.saturating_sub(1) as usize;
         if height == 0 {
             return;
         }
 
-        let Some(patch) = self.current_patch() else {
-            return;
+        let items = match self.view_mode {
+            DiffViewMode::Patch => self
+                .current_patch()
+                .map(|patch| self.patch_items(patch))
+                .unwrap_or_default(),
+            DiffViewMode::File => self
+                .current_whole_file()
+                .map(|file| self.whole_file_items(file))
+                .unwrap_or_default(),
         };
-        let items = self.diff_items(patch);
+        if items.is_empty() {
+            return;
+        }
         let mut line_visual_row = 0usize;
         let mut editor_end = None;
 
@@ -1212,9 +1660,27 @@ impl App {
             .and_then(|idx| self.files.get(*idx))
     }
 
+    fn current_line_count(&self) -> usize {
+        match self.view_mode {
+            DiffViewMode::Patch => self
+                .current_patch()
+                .map(|patch| patch.flat_lines.len())
+                .unwrap_or(0),
+            DiffViewMode::File => self
+                .current_whole_file()
+                .map(|file| file.lines.len())
+                .unwrap_or(0),
+        }
+    }
+
     fn current_patch(&self) -> Option<&HighlightedPatch> {
         self.selected_file_summary()
             .and_then(|summary| self.patch_cache.get(&summary.path))
+    }
+
+    fn current_whole_file(&self) -> Option<&WholeFileRender> {
+        self.selected_file_summary()
+            .and_then(|summary| self.whole_file_cache.get(&summary.path))
     }
 
     fn selected_range(&self) -> Option<(usize, usize)> {
@@ -1233,24 +1699,93 @@ impl App {
     }
 
     fn comments_on_line(&self, line_idx: usize) -> Vec<&Annotation> {
+        let line_ref = match self.view_mode {
+            DiffViewMode::Patch => self.current_patch().and_then(|patch| {
+                patch
+                    .flat_lines
+                    .get(line_idx)
+                    .map(|line| (line.old_lineno, line.new_lineno))
+            }),
+            DiffViewMode::File => self.current_whole_file().and_then(|file| {
+                file.lines
+                    .get(line_idx)
+                    .map(|line| (line.old_lineno, line.new_lineno))
+            }),
+        };
+
+        let Some((old_lineno, new_lineno)) = line_ref else {
+            return Vec::new();
+        };
+
         let Some(summary) = self.selected_file_summary() else {
             return Vec::new();
         };
 
         self.annotations
             .iter()
-            .filter(|annotation| {
-                annotation.file_path == summary.path
-                    && matches!(
-                        annotation.scope,
-                        AnnotationScope::Lines {
-                            start_line_idx,
-                            end_line_idx,
-                            ..
-                        } if line_idx >= start_line_idx && line_idx <= end_line_idx
-                    )
-            })
+            .filter(|annotation| annotation.file_path == summary.path)
+            .filter(|annotation| self.annotation_matches_line(annotation, old_lineno, new_lineno))
             .collect()
+    }
+
+    fn annotation_matches_line(
+        &self,
+        annotation: &Annotation,
+        old_lineno: Option<usize>,
+        new_lineno: Option<usize>,
+    ) -> bool {
+        let Some((start_ref, end_ref)) = annotation.line_refs() else {
+            return false;
+        };
+
+        let old_match = match (old_lineno, start_ref.old_lineno, end_ref.old_lineno) {
+            (Some(line), Some(start), Some(end)) => {
+                line >= start.min(end) && line <= start.max(end)
+            }
+            _ => false,
+        };
+        let new_match = match (new_lineno, start_ref.new_lineno, end_ref.new_lineno) {
+            (Some(line), Some(start), Some(end)) => {
+                line >= start.min(end) && line <= start.max(end)
+            }
+            _ => false,
+        };
+
+        old_match || new_match
+    }
+
+    fn find_whole_file_line(
+        &self,
+        old_lineno: Option<usize>,
+        new_lineno: Option<usize>,
+    ) -> Option<usize> {
+        self.current_whole_file().and_then(|file| {
+            file.lines.iter().position(|line| {
+                if let Some(new_lineno) = new_lineno {
+                    line.new_lineno == Some(new_lineno)
+                        && (old_lineno.is_none() || line.old_lineno == old_lineno)
+                } else {
+                    old_lineno.is_some() && line.old_lineno == old_lineno
+                }
+            })
+        })
+    }
+
+    fn find_patch_line(
+        &self,
+        old_lineno: Option<usize>,
+        new_lineno: Option<usize>,
+    ) -> Option<usize> {
+        self.current_patch().and_then(|patch| {
+            patch.flat_lines.iter().position(|line| {
+                if let Some(new_lineno) = new_lineno {
+                    line.new_lineno == Some(new_lineno)
+                        && (old_lineno.is_none() || line.old_lineno == old_lineno)
+                } else {
+                    old_lineno.is_some() && line.old_lineno == old_lineno
+                }
+            })
+        })
     }
 
     fn file_comments_for_selected_file(&self) -> Vec<&Annotation> {
@@ -1349,11 +1884,12 @@ fn change_color(change: &ChangeKind) -> Color {
     }
 }
 
-fn diff_sign_color(kind: DiffKind) -> Color {
+fn diff_sign_color(kind: Option<DiffKind>) -> Color {
     match kind {
-        DiffKind::Add => Color::Rgb(149, 198, 136),
-        DiffKind::Delete => Color::Rgb(224, 110, 110),
-        DiffKind::Context => Color::DarkGray,
+        Some(DiffKind::Add) => Color::Rgb(149, 198, 136),
+        Some(DiffKind::Delete) => Color::Rgb(224, 110, 110),
+        Some(DiffKind::Context) => Color::Rgb(133, 146, 178),
+        None => Color::DarkGray,
     }
 }
 
@@ -1362,6 +1898,13 @@ fn diff_base_style(kind: DiffKind) -> Style {
         DiffKind::Add => Style::default().bg(Color::Rgb(18, 40, 26)),
         DiffKind::Delete => Style::default().bg(Color::Rgb(50, 22, 22)),
         DiffKind::Context => Style::default().bg(Color::Rgb(18, 20, 26)),
+    }
+}
+
+fn whole_file_base_style(kind: Option<DiffKind>) -> Style {
+    match kind {
+        Some(kind) => diff_base_style(kind),
+        None => Style::default().bg(Color::Rgb(15, 17, 22)),
     }
 }
 

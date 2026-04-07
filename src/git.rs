@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::process::Command;
+use std::{fs, path::Path};
 
 use anyhow::{Context, Result, bail};
 
@@ -58,6 +59,25 @@ impl GitRepo {
             &summary.path,
         )?;
         parse_patch(summary.clone(), &patch_text)
+    }
+
+    pub fn load_file_text(&self, summary: &FileSummary) -> Result<Option<String>> {
+        if matches!(summary.change, ChangeKind::Deleted) {
+            return Ok(None);
+        }
+
+        if self.staged {
+            let spec = format!(":{}", summary.path);
+            let output = run_git(&self.root, ["show", "--no-color", spec.as_str()].as_slice())?;
+            return Ok(Some(output));
+        }
+
+        let path = self.root.join(Path::new(&summary.path));
+        match fs::read_to_string(&path) {
+            Ok(contents) => Ok(Some(contents)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err).with_context(|| format!("failed to read {}", path.display())),
+        }
     }
 
     fn run_diff(&self, extra_args: &[&str]) -> Result<String> {
@@ -193,6 +213,7 @@ fn parse_patch(summary: FileSummary, input: &str) -> Result<FilePatch> {
             new_line = new_start;
             current_hunk = Some(PatchHunk {
                 header: raw_line.to_string(),
+                new_start,
                 lines: Vec::new(),
             });
             continue;
