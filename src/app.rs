@@ -16,8 +16,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use syntect::easy::HighlightLines;
-use syntect::highlighting::{HighlightState, Highlighter, Theme, ThemeSet};
-use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
+use syntect::highlighting::{Theme, ThemeSet};
+use syntect::parsing::{SyntaxReference, SyntaxSet};
 
 use crate::cli::ReviewArgs;
 use crate::clipboard;
@@ -32,7 +32,6 @@ const NOTIFICATION_TTL: Duration = Duration::from_secs(3);
 const COMMENT_BOX_HEIGHT: u16 = 5;
 const FOOTER_HEIGHT: u16 = 1;
 const TWO_ROW_BREAKPOINT: u16 = 100;
-const WHOLE_FILE_HIGHLIGHT_CHUNK_SIZE: usize = 128;
 
 pub fn run(args: ReviewArgs) -> Result<()> {
     let repo = GitRepo::discover(&args)?;
@@ -109,16 +108,8 @@ struct WholeFileLine {
 }
 
 #[derive(Debug, Clone)]
-struct WholeFileHighlightCheckpoint {
-    next_line: usize,
-    parse_state: ParseState,
-    highlight_state: HighlightState,
-}
-
-#[derive(Debug, Clone)]
 struct WholeFileHighlightCache {
     lines: HashMap<usize, Vec<StyledSegment>>,
-    checkpoints: Vec<WholeFileHighlightCheckpoint>,
 }
 
 #[derive(Debug, Clone)]
@@ -965,50 +956,66 @@ impl App {
             return;
         };
 
-        let items = self.whole_file_items(file_len);
+        let layout = self.whole_file_layout();
         let mut y = 0u16;
         let mut visual_offset = 0usize;
+        if layout.file_comments_height > 0
+            && let Some(row_area) = next_visible_item_area(
+                inner,
+                &mut y,
+                &mut visual_offset,
+                self.diff_scroll,
+                layout.file_comments_height as u16,
+            )
+        {
+            self.render_file_comments(frame, row_area);
+        }
+        if layout.file_editor
+            && let Some(row_area) = next_visible_item_area(
+                inner,
+                &mut y,
+                &mut visual_offset,
+                self.diff_scroll,
+                COMMENT_BOX_HEIGHT,
+            )
+        {
+            self.render_comment_editor(frame, row_area);
+        }
 
-        for item in items {
-            if visual_offset + item.height as usize <= self.diff_scroll {
-                visual_offset += item.height as usize;
-                continue;
-            }
+        let start_line = layout.first_visible_line(self.diff_scroll, file_len);
+        visual_offset = layout.line_row_start(start_line);
+        for line_idx in start_line..file_len {
             if y >= inner.height {
                 break;
             }
 
-            let skip_rows = self.diff_scroll.saturating_sub(visual_offset);
-            let available_height = inner.height.saturating_sub(y);
-            let render_height = item
-                .height
-                .saturating_sub(skip_rows as u16)
-                .min(available_height);
-            if render_height == 0 {
-                visual_offset += item.height as usize;
-                continue;
+            if let Some(row_area) =
+                next_visible_item_area(inner, &mut y, &mut visual_offset, self.diff_scroll, 1)
+            {
+                self.render_whole_file_line(frame, row_area, line_idx);
             }
-
-            let row_area = Rect {
-                x: inner.x,
-                y: inner.y + y,
-                width: inner.width,
-                height: render_height,
-            };
-
-            match item.kind {
-                DiffItemKind::FileComments => self.render_file_comments(frame, row_area),
-                DiffItemKind::Line(line_idx) => {
-                    self.render_whole_file_line(frame, row_area, line_idx);
-                }
-                DiffItemKind::Editor => self.render_comment_editor(frame, row_area),
-                DiffItemKind::ExpandedComments { line_idx } => {
-                    self.render_expanded_comments(frame, row_area, line_idx);
-                }
+            if layout.editor_anchor == Some(line_idx)
+                && let Some(row_area) = next_visible_item_area(
+                    inner,
+                    &mut y,
+                    &mut visual_offset,
+                    self.diff_scroll,
+                    COMMENT_BOX_HEIGHT,
+                )
+            {
+                self.render_comment_editor(frame, row_area);
             }
-
-            y += render_height;
-            visual_offset += item.height as usize;
+            if layout.expanded_anchor == Some(line_idx)
+                && let Some(row_area) = next_visible_item_area(
+                    inner,
+                    &mut y,
+                    &mut visual_offset,
+                    self.diff_scroll,
+                    COMMENT_BOX_HEIGHT,
+                )
+            {
+                self.render_expanded_comments(frame, row_area, line_idx);
+            }
         }
     }
 
@@ -1337,14 +1344,6 @@ impl App {
                     summary.path.clone(),
                     WholeFileHighlightCache {
                         lines: HashMap::new(),
-                        checkpoints: vec![WholeFileHighlightCheckpoint {
-                            next_line: 0,
-                            parse_state: ParseState::new(self.syntax_for_path(&summary.path)),
-                            highlight_state: HighlightState::new(
-                                &Highlighter::new(&self.syntax_theme),
-                                ScopeStack::new(),
-                            ),
-                        }],
                     },
                 );
                 true
@@ -1539,132 +1538,106 @@ impl App {
         items
     }
 
-    fn whole_file_items(&self, file_line_count: usize) -> Vec<DiffItem> {
-        let mut items = Vec::new();
-        let file_comments_count = self.file_comments_for_selected_file().len();
-        let show_file_comments = file_comments_count > 0;
-        let file_editor = matches!(
-            self.comment_draft.as_ref().map(|draft| draft.target),
-            Some(CommentTarget::File)
-        );
-        let editor_anchor = self
-            .comment_draft
-            .as_ref()
-            .and_then(|draft| match draft.target {
-                CommentTarget::File => None,
-                CommentTarget::Range(range) => Some(range.normalized().1),
-            });
-        let expanded_anchor = self.expanded_comment_line;
-
-        if show_file_comments {
-            items.push(DiffItem {
-                kind: DiffItemKind::FileComments,
-                height: file_comments_height(file_comments_count),
-            });
-        }
-        if file_editor {
-            items.push(DiffItem {
-                kind: DiffItemKind::Editor,
-                height: COMMENT_BOX_HEIGHT,
-            });
-        }
-
-        for line_idx in 0..file_line_count {
-            items.push(DiffItem {
-                kind: DiffItemKind::Line(line_idx),
-                height: 1,
-            });
-            if Some(line_idx) == editor_anchor {
-                items.push(DiffItem {
-                    kind: DiffItemKind::Editor,
-                    height: COMMENT_BOX_HEIGHT,
-                });
-            }
-            if Some(line_idx) == expanded_anchor {
-                items.push(DiffItem {
-                    kind: DiffItemKind::ExpandedComments { line_idx },
-                    height: COMMENT_BOX_HEIGHT,
-                });
-            }
-        }
-
-        items
-    }
-
     fn ensure_cursor_visible(&mut self) {
         let height = self.last_diff_inner_height.saturating_sub(1) as usize;
         if height == 0 {
             return;
         }
 
-        let items = match self.view_mode {
-            DiffViewMode::Patch => self
-                .current_patch()
-                .map(|patch| self.patch_items(patch))
-                .unwrap_or_default(),
-            DiffViewMode::File => self
-                .current_whole_file()
-                .map(|file| self.whole_file_items(file.lines.len()))
-                .unwrap_or_default(),
-        };
-        if items.is_empty() {
-            return;
-        }
-        let mut line_visual_row = 0usize;
-        let mut editor_end = None;
+        let (line_visual_row, editor_end) = match self.view_mode {
+            DiffViewMode::Patch => {
+                let items = self
+                    .current_patch()
+                    .map(|patch| self.patch_items(patch))
+                    .unwrap_or_default();
+                if items.is_empty() {
+                    return;
+                }
+                let mut line_visual_row = 0usize;
+                let mut editor_end = None;
 
-        for item in &items {
-            match item.kind {
-                DiffItemKind::Line(line_idx) if line_idx == self.diff_cursor => break,
-                DiffItemKind::FileComments => {
-                    line_visual_row += item.height as usize;
-                }
-                DiffItemKind::Line(_)
-                | DiffItemKind::Editor
-                | DiffItemKind::ExpandedComments { .. } => {
-                    line_visual_row += item.height as usize;
-                }
-            }
-        }
-
-        if let Some(draft) = &self.comment_draft {
-            match draft.target {
-                CommentTarget::File => {
-                    editor_end = Some(
-                        items
-                            .iter()
-                            .take_while(|item| !matches!(item.kind, DiffItemKind::Line(_)))
-                            .map(|item| item.height as usize)
-                            .sum(),
-                    );
-                }
-                CommentTarget::Range(range) => {
-                    let anchor = range.normalized().1;
-                    let mut offset = 0usize;
-                    for item in &items {
-                        match item.kind {
-                            DiffItemKind::Line(line_idx) if line_idx == anchor => {
-                                offset += 1;
-                            }
-                            DiffItemKind::Editor => {
-                                editor_end = Some(offset + item.height as usize);
-                                break;
-                            }
-                            _ => offset += item.height as usize,
+                for item in &items {
+                    match item.kind {
+                        DiffItemKind::Line(line_idx) if line_idx == self.diff_cursor => break,
+                        DiffItemKind::FileComments => {
+                            line_visual_row += item.height as usize;
+                        }
+                        DiffItemKind::Line(_)
+                        | DiffItemKind::Editor
+                        | DiffItemKind::ExpandedComments { .. } => {
+                            line_visual_row += item.height as usize;
                         }
                     }
                 }
-            }
-        } else if self.expanded_comment_line.is_some() {
-            let mut offset = 0usize;
-            for item in &items {
-                if matches!(item.kind, DiffItemKind::ExpandedComments { .. }) {
-                    editor_end = Some(offset + item.height as usize);
-                    break;
+
+                if let Some(draft) = &self.comment_draft {
+                    match draft.target {
+                        CommentTarget::File => {
+                            editor_end = Some(
+                                items
+                                    .iter()
+                                    .take_while(|item| !matches!(item.kind, DiffItemKind::Line(_)))
+                                    .map(|item| item.height as usize)
+                                    .sum(),
+                            );
+                        }
+                        CommentTarget::Range(range) => {
+                            let anchor = range.normalized().1;
+                            let mut offset = 0usize;
+                            for item in &items {
+                                match item.kind {
+                                    DiffItemKind::Line(line_idx) if line_idx == anchor => {
+                                        offset += 1;
+                                    }
+                                    DiffItemKind::Editor => {
+                                        editor_end = Some(offset + item.height as usize);
+                                        break;
+                                    }
+                                    _ => offset += item.height as usize,
+                                }
+                            }
+                        }
+                    }
+                } else if self.expanded_comment_line.is_some() {
+                    let mut offset = 0usize;
+                    for item in &items {
+                        if matches!(item.kind, DiffItemKind::ExpandedComments { .. }) {
+                            editor_end = Some(offset + item.height as usize);
+                            break;
+                        }
+                        offset += item.height as usize;
+                    }
                 }
-                offset += item.height as usize;
+
+                (line_visual_row, editor_end)
             }
-        }
+            DiffViewMode::File => {
+                let Some(file_len) = self.current_whole_file().map(|file| file.lines.len()) else {
+                    return;
+                };
+                if file_len == 0 {
+                    return;
+                }
+                let layout = self.whole_file_layout();
+                let line_visual_row = layout.line_row_start(self.diff_cursor.min(file_len - 1));
+                let editor_end = if let Some(draft) = &self.comment_draft {
+                    match draft.target {
+                        CommentTarget::File => {
+                            Some(layout.file_comments_height + COMMENT_BOX_HEIGHT as usize)
+                        }
+                        CommentTarget::Range(range) => Some(
+                            layout.editor_start(range.normalized().1) + COMMENT_BOX_HEIGHT as usize,
+                        ),
+                    }
+                } else {
+                    layout.expanded_anchor.map(|line_idx| {
+                        layout.expanded_start(line_idx) + COMMENT_BOX_HEIGHT as usize
+                    })
+                };
+
+                (line_visual_row, editor_end)
+            }
+        };
 
         if line_visual_row < self.diff_scroll {
             self.diff_scroll = line_visual_row;
@@ -1706,6 +1679,32 @@ impl App {
     fn current_whole_file(&self) -> Option<&WholeFileRender> {
         self.selected_file_summary()
             .and_then(|summary| self.whole_file_cache.get(&summary.path))
+    }
+
+    fn whole_file_layout(&self) -> WholeFileLayout {
+        let file_comments_count = self.file_comments_for_selected_file().len();
+        let file_editor = matches!(
+            self.comment_draft.as_ref().map(|draft| draft.target),
+            Some(CommentTarget::File)
+        );
+        let editor_anchor = self
+            .comment_draft
+            .as_ref()
+            .and_then(|draft| match draft.target {
+                CommentTarget::File => None,
+                CommentTarget::Range(range) => Some(range.normalized().1),
+            });
+
+        WholeFileLayout {
+            file_comments_height: if file_comments_count > 0 {
+                file_comments_height(file_comments_count) as usize
+            } else {
+                0
+            },
+            file_editor,
+            editor_anchor,
+            expanded_anchor: self.expanded_comment_line,
+        }
     }
 
     fn selected_range(&self) -> Option<(usize, usize)> {
@@ -1882,82 +1881,17 @@ impl App {
             return segments;
         }
 
-        let target_end = {
-            let cache = match self.whole_file_highlight_cache.get(&path) {
-                Some(cache) => cache,
-                None => return Vec::new(),
-            };
-            let checkpoint = match cache
-                .checkpoints
-                .iter()
-                .filter(|checkpoint| checkpoint.next_line <= line_idx)
-                .max_by_key(|checkpoint| checkpoint.next_line)
-            {
-                Some(checkpoint) => checkpoint,
-                None => return Vec::new(),
-            };
-            if checkpoint.next_line > line_idx {
-                checkpoint.next_line
-            } else {
-                (line_idx + WHOLE_FILE_HIGHLIGHT_CHUNK_SIZE).min(file.lines.len())
-            }
+        let Some(line) = file.lines.get(line_idx) else {
+            return Vec::new();
         };
-
-        let checkpoint = match self
-            .whole_file_highlight_cache
-            .get(&path)
-            .and_then(|cache| {
-                cache
-                    .checkpoints
-                    .iter()
-                    .filter(|checkpoint| checkpoint.next_line <= line_idx)
-                    .max_by_key(|checkpoint| checkpoint.next_line)
-                    .cloned()
-            }) {
-            Some(checkpoint) => checkpoint,
-            None => return Vec::new(),
-        };
-
-        let mut highlighter = HighlightLines::from_state(
-            &self.syntax_theme,
-            checkpoint.highlight_state,
-            checkpoint.parse_state,
-        );
-        let start = checkpoint.next_line;
-        let mut computed = Vec::new();
-        for current_idx in start..target_end {
-            let Some(line) = file.lines.get(current_idx) else {
-                break;
-            };
-            computed.push((
-                current_idx,
-                highlight_line_segments(&self.syntax_set, &mut highlighter, &line.text),
-            ));
-        }
-        let (highlight_state, parse_state) = highlighter.state();
+        let mut highlighter = HighlightLines::new(self.syntax_for_path(&path), &self.syntax_theme);
+        let segments = highlight_line_segments(&self.syntax_set, &mut highlighter, &line.text);
 
         if let Some(cache) = self.whole_file_highlight_cache.get_mut(&path) {
-            for (current_idx, segments) in computed {
-                cache.lines.insert(current_idx, segments);
-            }
-
-            let should_push_checkpoint = cache
-                .checkpoints
-                .last()
-                .map(|last| last.next_line < target_end)
-                .unwrap_or(true);
-            if should_push_checkpoint {
-                cache.checkpoints.push(WholeFileHighlightCheckpoint {
-                    next_line: target_end,
-                    parse_state,
-                    highlight_state,
-                });
-            }
-
-            return cache.lines.get(&line_idx).cloned().unwrap_or_default();
+            cache.lines.insert(line_idx, segments.clone());
         }
 
-        Vec::new()
+        segments
     }
 }
 
@@ -1965,6 +1899,85 @@ impl App {
 struct DiffItem {
     kind: DiffItemKind,
     height: u16,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WholeFileLayout {
+    file_comments_height: usize,
+    file_editor: bool,
+    editor_anchor: Option<usize>,
+    expanded_anchor: Option<usize>,
+}
+
+impl WholeFileLayout {
+    fn prefix_rows(self) -> usize {
+        self.file_comments_height
+            + if self.file_editor {
+                COMMENT_BOX_HEIGHT as usize
+            } else {
+                0
+            }
+    }
+
+    fn line_row_start(self, line_idx: usize) -> usize {
+        self.prefix_rows() + line_idx + self.extra_rows_before_line(line_idx)
+    }
+
+    fn editor_start(self, line_idx: usize) -> usize {
+        self.line_row_start(line_idx) + 1
+    }
+
+    fn expanded_start(self, line_idx: usize) -> usize {
+        self.editor_start(line_idx)
+            + if self.editor_anchor == Some(line_idx) {
+                COMMENT_BOX_HEIGHT as usize
+            } else {
+                0
+            }
+    }
+
+    fn first_visible_line(self, diff_scroll: usize, file_line_count: usize) -> usize {
+        if file_line_count == 0 || diff_scroll <= self.prefix_rows() {
+            return 0;
+        }
+
+        let mut line_idx = diff_scroll
+            .saturating_sub(self.prefix_rows())
+            .min(file_line_count - 1);
+
+        for _ in 0..3 {
+            let adjusted = diff_scroll
+                .saturating_sub(self.prefix_rows() + self.extra_rows_before_line(line_idx))
+                .min(file_line_count - 1);
+            if adjusted == line_idx {
+                break;
+            }
+            line_idx = adjusted;
+        }
+
+        while line_idx > 0 && self.line_row_start(line_idx) > diff_scroll {
+            line_idx -= 1;
+        }
+        while line_idx + 1 < file_line_count && self.line_row_start(line_idx + 1) <= diff_scroll {
+            line_idx += 1;
+        }
+
+        line_idx
+    }
+
+    fn extra_rows_before_line(self, line_idx: usize) -> usize {
+        let editor_rows = if self.editor_anchor.is_some_and(|anchor| anchor < line_idx) {
+            COMMENT_BOX_HEIGHT as usize
+        } else {
+            0
+        };
+        let expanded_rows = if self.expanded_anchor.is_some_and(|anchor| anchor < line_idx) {
+            COMMENT_BOX_HEIGHT as usize
+        } else {
+            0
+        };
+        editor_rows + expanded_rows
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1977,6 +1990,39 @@ enum DiffItemKind {
 
 fn file_comments_height(comment_count: usize) -> u16 {
     (comment_count as u16 + 2).clamp(3, 6)
+}
+
+fn next_visible_item_area(
+    inner: Rect,
+    y: &mut u16,
+    visual_offset: &mut usize,
+    diff_scroll: usize,
+    item_height: u16,
+) -> Option<Rect> {
+    let current_offset = *visual_offset;
+    *visual_offset += item_height as usize;
+
+    if current_offset + item_height as usize <= diff_scroll || *y >= inner.height {
+        return None;
+    }
+
+    let skip_rows = diff_scroll.saturating_sub(current_offset);
+    let available_height = inner.height.saturating_sub(*y);
+    let render_height = item_height
+        .saturating_sub(skip_rows as u16)
+        .min(available_height);
+    if render_height == 0 {
+        return None;
+    }
+
+    let row_area = Rect {
+        x: inner.x,
+        y: inner.y + *y,
+        width: inner.width,
+        height: render_height,
+    };
+    *y += render_height;
+    Some(row_area)
 }
 
 fn highlight_line_segments(
@@ -2088,9 +2134,11 @@ fn syntax_extension_aliases(extension: &str) -> &'static [&'static str] {
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
     use std::fs;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     struct TempDirGuard {
         path: PathBuf,
@@ -2476,5 +2524,74 @@ mod tests {
         assert_eq!(line.spans[0].content.as_ref(), "review note");
         assert_eq!(line.spans[1].content.as_ref(), "▊");
         assert_eq!(line.spans[1].style.fg, Some(Color::Rgb(216, 180, 84)));
+    }
+
+    #[test]
+    #[ignore = "profiling helper"]
+    fn profile_whole_file_render_path() {
+        let temp = TempDirGuard::new();
+        let summary = file_summary("src/huge.ts");
+        let mut app = test_app(temp.path.clone(), vec![summary.clone()]);
+        app.view_mode = DiffViewMode::File;
+
+        let line_count = 50_000usize;
+        let lines: Vec<WholeFileLine> = (0..line_count)
+            .map(|idx| WholeFileLine {
+                old_lineno: Some(idx + 1),
+                new_lineno: Some(idx + 1),
+                text: format!("const value{idx} = value{idx} + 1;"),
+                diff_kind: if idx % 200 == 0 {
+                    Some(DiffKind::Add)
+                } else {
+                    None
+                },
+                hunk_header: if idx % 200 == 0 {
+                    Some(format!("@@ -{},1 +{},1 @@", idx + 1, idx + 1))
+                } else {
+                    None
+                },
+            })
+            .collect();
+        let hunk_starts = (0..line_count).step_by(200).collect();
+        app.whole_file_cache
+            .insert(summary.path.clone(), WholeFileRender { lines, hunk_starts });
+        app.whole_file_highlight_cache.insert(
+            summary.path.clone(),
+            WholeFileHighlightCache {
+                lines: HashMap::new(),
+            },
+        );
+
+        let mut terminal =
+            Terminal::new(TestBackend::new(140, 40)).expect("test terminal should initialize");
+
+        app.diff_scroll = 0;
+        let start = Instant::now();
+        for _ in 0..25 {
+            terminal
+                .draw(|frame| app.render(frame))
+                .expect("render should succeed");
+        }
+        let top_render_elapsed = start.elapsed();
+
+        app.diff_cursor = line_count / 2;
+        app.diff_scroll = line_count / 2;
+        let start = Instant::now();
+        for _ in 0..25 {
+            terminal
+                .draw(|frame| app.render(frame))
+                .expect("render should succeed");
+        }
+        let deep_render_elapsed = start.elapsed();
+
+        let start = Instant::now();
+        for _ in 0..1_000 {
+            app.ensure_cursor_visible();
+        }
+        let cursor_elapsed = start.elapsed();
+
+        println!("whole-file top render(25x, {line_count} lines): {top_render_elapsed:?}");
+        println!("whole-file deep render(25x, {line_count} lines): {deep_render_elapsed:?}");
+        println!("ensure_cursor_visible(1000x): {cursor_elapsed:?}");
     }
 }
