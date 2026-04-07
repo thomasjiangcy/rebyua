@@ -15,8 +15,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use syntect::easy::HighlightLines;
-use syntect::highlighting::{Theme, ThemeSet};
-use syntect::parsing::SyntaxSet;
+use syntect::highlighting::{HighlightState, Highlighter, Theme, ThemeSet};
+use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
 
 use crate::cli::ReviewArgs;
 use crate::clipboard;
@@ -31,6 +31,7 @@ const NOTIFICATION_TTL: Duration = Duration::from_secs(3);
 const COMMENT_BOX_HEIGHT: u16 = 5;
 const FOOTER_HEIGHT: u16 = 1;
 const TWO_ROW_BREAKPOINT: u16 = 100;
+const WHOLE_FILE_HIGHLIGHT_CHUNK_SIZE: usize = 128;
 
 pub fn run(args: ReviewArgs) -> Result<()> {
     let repo = GitRepo::discover(&args)?;
@@ -104,7 +105,19 @@ struct WholeFileLine {
     text: String,
     diff_kind: Option<DiffKind>,
     hunk_header: Option<String>,
-    highlights: Vec<StyledSegment>,
+}
+
+#[derive(Debug, Clone)]
+struct WholeFileHighlightCheckpoint {
+    next_line: usize,
+    parse_state: ParseState,
+    highlight_state: HighlightState,
+}
+
+#[derive(Debug, Clone)]
+struct WholeFileHighlightCache {
+    lines: HashMap<usize, Vec<StyledSegment>>,
+    checkpoints: Vec<WholeFileHighlightCheckpoint>,
 }
 
 #[derive(Debug, Clone)]
@@ -153,6 +166,7 @@ struct App {
     view_mode: DiffViewMode,
     patch_cache: HashMap<String, HighlightedPatch>,
     whole_file_cache: HashMap<String, WholeFileRender>,
+    whole_file_highlight_cache: HashMap<String, WholeFileHighlightCache>,
     diff_cursor: usize,
     diff_scroll: usize,
     selection: Option<SelectionRange>,
@@ -190,6 +204,7 @@ impl App {
             view_mode: DiffViewMode::Patch,
             patch_cache: HashMap::new(),
             whole_file_cache: HashMap::new(),
+            whole_file_highlight_cache: HashMap::new(),
             diff_cursor: 0,
             diff_scroll: 0,
             selection: None,
@@ -928,7 +943,7 @@ impl App {
     }
 
     fn render_whole_file_view(&mut self, frame: &mut Frame, inner: Rect) {
-        let Some(file) = self.current_whole_file() else {
+        let Some(file_len) = self.current_whole_file().map(|file| file.lines.len()) else {
             let empty = Paragraph::new("Whole-file view is unavailable for this selection.")
                 .style(Style::default().fg(Color::DarkGray))
                 .wrap(Wrap { trim: false });
@@ -936,7 +951,7 @@ impl App {
             return;
         };
 
-        let items = self.whole_file_items(file);
+        let items = self.whole_file_items(file_len);
         let mut y = 0u16;
         let mut visual_offset = 0usize;
 
@@ -970,7 +985,7 @@ impl App {
             match item.kind {
                 DiffItemKind::FileComments => self.render_file_comments(frame, row_area),
                 DiffItemKind::Line(line_idx) => {
-                    self.render_whole_file_line(frame, row_area, file, line_idx);
+                    self.render_whole_file_line(frame, row_area, line_idx);
                 }
                 DiffItemKind::Editor => self.render_comment_editor(frame, row_area),
                 DiffItemKind::ExpandedComments { line_idx } => {
@@ -1045,14 +1060,14 @@ impl App {
         frame.render_widget(Paragraph::new(Line::from(spans)).style(line_style), area);
     }
 
-    fn render_whole_file_line(
-        &self,
-        frame: &mut Frame,
-        area: Rect,
-        file: &WholeFileRender,
-        line_idx: usize,
-    ) {
-        let line = &file.lines[line_idx];
+    fn render_whole_file_line(&mut self, frame: &mut Frame, area: Rect, line_idx: usize) {
+        let Some(line) = self
+            .current_whole_file()
+            .and_then(|file| file.lines.get(line_idx))
+            .cloned()
+        else {
+            return;
+        };
         let in_selection = self
             .selected_range()
             .map(|(start, end)| line_idx >= start && line_idx <= end)
@@ -1095,11 +1110,12 @@ impl App {
             Span::raw(" "),
         ];
 
-        if line.highlights.is_empty() {
+        let highlighted = self.whole_file_highlights(line_idx);
+        if highlighted.is_empty() {
             spans.push(Span::raw(line.text.clone()));
         } else {
-            for segment in &line.highlights {
-                spans.push(Span::styled(segment.text.clone(), segment.style));
+            for segment in highlighted {
+                spans.push(Span::styled(segment.text, segment.style));
             }
         }
 
@@ -1301,8 +1317,22 @@ impl App {
 
         match self.repo.load_file_text(&summary) {
             Ok(Some(text)) => {
-                let whole = self.highlight_whole_file(patch, &text);
+                let whole = self.build_whole_file_render(patch, &text);
                 self.whole_file_cache.insert(summary.path.clone(), whole);
+                self.whole_file_highlight_cache.insert(
+                    summary.path.clone(),
+                    WholeFileHighlightCache {
+                        lines: HashMap::new(),
+                        checkpoints: vec![WholeFileHighlightCheckpoint {
+                            next_line: 0,
+                            parse_state: ParseState::new(self.syntax_for_path(&summary.path)),
+                            highlight_state: HighlightState::new(
+                                &Highlighter::new(&self.syntax_theme),
+                                ScopeStack::new(),
+                            ),
+                        }],
+                    },
+                );
                 true
             }
             Ok(None) => false,
@@ -1350,15 +1380,7 @@ impl App {
         }
     }
 
-    fn highlight_whole_file(&self, patch: &HighlightedPatch, text: &str) -> WholeFileRender {
-        let syntax = self
-            .syntax_set
-            .find_syntax_for_file(&patch.patch.summary.path)
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text());
-        let mut highlighter = HighlightLines::new(syntax, &self.syntax_theme);
-
+    fn build_whole_file_render(&self, patch: &HighlightedPatch, text: &str) -> WholeFileRender {
         let mut current_lines: Vec<WholeFileLine> = text
             .lines()
             .enumerate()
@@ -1368,7 +1390,6 @@ impl App {
                 text: line.to_string(),
                 diff_kind: None,
                 hunk_header: None,
-                highlights: highlight_line_segments(&self.syntax_set, &mut highlighter, line),
             })
             .collect();
 
@@ -1387,11 +1408,6 @@ impl App {
                             text: line.text.clone(),
                             diff_kind: Some(DiffKind::Delete),
                             hunk_header: Some(hunk.header.clone()),
-                            highlights: highlight_line_segments(
-                                &self.syntax_set,
-                                &mut highlighter,
-                                &line.text,
-                            ),
                         });
                     }
                     DiffKind::Add | DiffKind::Context => {
@@ -1514,7 +1530,7 @@ impl App {
         items
     }
 
-    fn whole_file_items(&self, file: &WholeFileRender) -> Vec<DiffItem> {
+    fn whole_file_items(&self, file_line_count: usize) -> Vec<DiffItem> {
         let mut items = Vec::new();
         let file_comments_count = self.file_comments_for_selected_file().len();
         let show_file_comments = file_comments_count > 0;
@@ -1544,7 +1560,7 @@ impl App {
             });
         }
 
-        for line_idx in 0..file.lines.len() {
+        for line_idx in 0..file_line_count {
             items.push(DiffItem {
                 kind: DiffItemKind::Line(line_idx),
                 height: 1,
@@ -1579,7 +1595,7 @@ impl App {
                 .unwrap_or_default(),
             DiffViewMode::File => self
                 .current_whole_file()
-                .map(|file| self.whole_file_items(file))
+                .map(|file| self.whole_file_items(file.lines.len()))
                 .unwrap_or_default(),
         };
         if items.is_empty() {
@@ -1811,6 +1827,113 @@ impl App {
             created_at: Instant::now(),
             kind,
         });
+    }
+
+    fn syntax_for_path(&self, path: &str) -> &SyntaxReference {
+        self.syntax_set
+            .find_syntax_for_file(path)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text())
+    }
+
+    fn whole_file_highlights(&mut self, line_idx: usize) -> Vec<StyledSegment> {
+        let Some(summary) = self.selected_file_summary() else {
+            return Vec::new();
+        };
+        let path = summary.path.clone();
+        let Some(file) = self.whole_file_cache.get(&path) else {
+            return Vec::new();
+        };
+        if line_idx >= file.lines.len() {
+            return Vec::new();
+        }
+
+        if let Some(segments) = self
+            .whole_file_highlight_cache
+            .get(&path)
+            .and_then(|cache| cache.lines.get(&line_idx))
+            .cloned()
+        {
+            return segments;
+        }
+
+        let target_end = {
+            let cache = match self.whole_file_highlight_cache.get(&path) {
+                Some(cache) => cache,
+                None => return Vec::new(),
+            };
+            let checkpoint = match cache
+                .checkpoints
+                .iter()
+                .filter(|checkpoint| checkpoint.next_line <= line_idx)
+                .max_by_key(|checkpoint| checkpoint.next_line)
+            {
+                Some(checkpoint) => checkpoint,
+                None => return Vec::new(),
+            };
+            if checkpoint.next_line > line_idx {
+                checkpoint.next_line
+            } else {
+                (line_idx + WHOLE_FILE_HIGHLIGHT_CHUNK_SIZE).min(file.lines.len())
+            }
+        };
+
+        let checkpoint = match self
+            .whole_file_highlight_cache
+            .get(&path)
+            .and_then(|cache| {
+                cache
+                    .checkpoints
+                    .iter()
+                    .filter(|checkpoint| checkpoint.next_line <= line_idx)
+                    .max_by_key(|checkpoint| checkpoint.next_line)
+                    .cloned()
+            }) {
+            Some(checkpoint) => checkpoint,
+            None => return Vec::new(),
+        };
+
+        let mut highlighter = HighlightLines::from_state(
+            &self.syntax_theme,
+            checkpoint.highlight_state,
+            checkpoint.parse_state,
+        );
+        let start = checkpoint.next_line;
+        let mut computed = Vec::new();
+        for current_idx in start..target_end {
+            let Some(line) = file.lines.get(current_idx) else {
+                break;
+            };
+            computed.push((
+                current_idx,
+                highlight_line_segments(&self.syntax_set, &mut highlighter, &line.text),
+            ));
+        }
+        let (highlight_state, parse_state) = highlighter.state();
+
+        if let Some(cache) = self.whole_file_highlight_cache.get_mut(&path) {
+            for (current_idx, segments) in computed {
+                cache.lines.insert(current_idx, segments);
+            }
+
+            let should_push_checkpoint = cache
+                .checkpoints
+                .last()
+                .map(|last| last.next_line < target_end)
+                .unwrap_or(true);
+            if should_push_checkpoint {
+                cache.checkpoints.push(WholeFileHighlightCheckpoint {
+                    next_line: target_end,
+                    parse_state,
+                    highlight_state,
+                });
+            }
+
+            return cache.lines.get(&line_idx).cloned().unwrap_or_default();
+        }
+
+        Vec::new()
     }
 }
 
