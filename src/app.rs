@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -186,7 +187,7 @@ struct App {
 
 impl App {
     fn new(repo: GitRepo, files: Vec<FileSummary>) -> Self {
-        let syntax_set = SyntaxSet::load_defaults_newlines();
+        let syntax_set = SyntaxSet::load_defaults_nonewlines();
         let theme_set = ThemeSet::load_defaults();
         let syntax_theme = theme_set
             .themes
@@ -248,6 +249,8 @@ impl App {
                     self.load_selected_patch();
                 }
             }
+            KeyCode::Char('n') => self.move_file_selection(1),
+            KeyCode::Char('p') => self.move_file_selection(-1),
             KeyCode::Char('j') => self.move_down(),
             KeyCode::Char('k') => self.move_up(),
             KeyCode::Char('J') => self.move_hunk(1),
@@ -333,12 +336,7 @@ impl App {
 
     fn move_down(&mut self) {
         match self.focus {
-            Focus::Files => {
-                if self.selected_file_view_idx + 1 < self.filtered_file_indices.len() {
-                    self.selected_file_view_idx += 1;
-                    self.reset_diff_view_for_selected_file();
-                }
-            }
+            Focus::Files => self.move_file_selection(1),
             Focus::Diff => {
                 let line_count = self.current_line_count();
                 if line_count == 0 {
@@ -361,12 +359,7 @@ impl App {
 
     fn move_up(&mut self) {
         match self.focus {
-            Focus::Files => {
-                if self.selected_file_view_idx > 0 {
-                    self.selected_file_view_idx -= 1;
-                    self.reset_diff_view_for_selected_file();
-                }
-            }
+            Focus::Files => self.move_file_selection(-1),
             Focus::Diff => {
                 if self.diff_cursor > 0 {
                     self.diff_cursor -= 1;
@@ -381,6 +374,27 @@ impl App {
                 }
             }
         }
+    }
+
+    fn move_file_selection(&mut self, direction: isize) {
+        let file_count = self.filtered_file_indices.len();
+        if file_count == 0 {
+            return;
+        }
+
+        self.selected_file_view_idx = if direction >= 0 {
+            if self.selected_file_view_idx + 1 < file_count {
+                self.selected_file_view_idx + 1
+            } else {
+                0
+            }
+        } else if self.selected_file_view_idx > 0 {
+            self.selected_file_view_idx - 1
+        } else {
+            file_count - 1
+        };
+
+        self.reset_diff_view_for_selected_file();
     }
 
     fn move_hunk(&mut self, direction: isize) {
@@ -1150,7 +1164,7 @@ impl App {
             .map(|draft| draft.text.as_str())
             .unwrap_or_default();
         frame.render_widget(
-            Paragraph::new(draft_text)
+            Paragraph::new(comment_editor_line(draft_text))
                 .wrap(Wrap { trim: false })
                 .style(Style::default().fg(Color::White)),
             inner,
@@ -1231,7 +1245,7 @@ impl App {
             Line::from("Comment mode: type to write, Enter to save, Esc to cancel")
         } else {
             Line::from(
-                "h/l focus  j/k move  t toggle  v select  c line  C file  Enter inspect  E copy",
+                "h/l focus  j/k move  n/p file  t toggle  v select  c line  C file  Enter inspect  E copy",
             )
         };
 
@@ -1347,12 +1361,7 @@ impl App {
     }
 
     fn highlight_patch(&self, patch: FilePatch) -> HighlightedPatch {
-        let syntax = self
-            .syntax_set
-            .find_syntax_for_file(&patch.summary.path)
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text());
+        let syntax = self.syntax_for_path(&patch.summary.path);
 
         let mut highlighter = HighlightLines::new(syntax, &self.syntax_theme);
         let mut flat_lines = Vec::new();
@@ -1830,10 +1839,25 @@ impl App {
     }
 
     fn syntax_for_path(&self, path: &str) -> &SyntaxReference {
-        self.syntax_set
-            .find_syntax_for_file(path)
-            .ok()
-            .flatten()
+        Path::new(path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .and_then(|extension| {
+                self.syntax_set
+                    .find_syntax_by_extension(extension)
+                    .or_else(|| {
+                        syntax_extension_aliases(extension)
+                            .iter()
+                            .copied()
+                            .find_map(|alias| self.syntax_set.find_syntax_by_extension(alias))
+                    })
+            })
+            .or_else(|| {
+                self.syntax_set
+                    .find_syntax_for_file(self.repo.root.join(path))
+                    .ok()
+                    .flatten()
+            })
             .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text())
     }
 
@@ -2039,6 +2063,27 @@ fn panel_border(active: bool) -> Style {
     }
 }
 
+fn comment_editor_line(draft_text: &str) -> Line<'static> {
+    let mut spans = Vec::new();
+    if !draft_text.is_empty() {
+        spans.push(Span::raw(draft_text.to_string()));
+    }
+    spans.push(Span::styled(
+        "▊",
+        Style::default().fg(Color::Rgb(216, 180, 84)),
+    ));
+    Line::from(spans)
+}
+
+fn syntax_extension_aliases(extension: &str) -> &'static [&'static str] {
+    match extension {
+        "ts" | "mts" | "cts" => &["js"],
+        "tsx" => &["jsx", "js"],
+        "mjs" | "cjs" => &["js"],
+        _ => &[],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2165,7 +2210,7 @@ mod tests {
             pending_quit_confirmation: false,
             should_quit: false,
             last_diff_inner_height: 20,
-            syntax_set: SyntaxSet::load_defaults_newlines(),
+            syntax_set: SyntaxSet::load_defaults_nonewlines(),
             syntax_theme: test_theme(),
         }
     }
@@ -2338,5 +2383,98 @@ mod tests {
             .expect("toggle back to patch view should succeed");
         assert_eq!(app.view_mode, DiffViewMode::Patch);
         assert_eq!(app.diff_cursor, 2);
+    }
+
+    #[test]
+    fn file_list_navigation_wraps_at_both_ends() {
+        let temp = TempDirGuard::new();
+        let files = vec![
+            file_summary("src/one.rs"),
+            file_summary("src/two.rs"),
+            file_summary("src/three.rs"),
+        ];
+        let mut app = test_app(temp.path.clone(), files);
+        app.focus = Focus::Files;
+        app.filtered_file_indices = vec![0, 1, 2];
+        app.selected_file_view_idx = 2;
+
+        app.on_key(key_char('j'))
+            .expect("moving down from the last file should wrap");
+        assert_eq!(app.selected_file_view_idx, 0);
+
+        app.on_key(key_char('k'))
+            .expect("moving up from the first file should wrap");
+        assert_eq!(app.selected_file_view_idx, 2);
+    }
+
+    #[test]
+    fn next_and_previous_file_hotkeys_work_from_diff_focus() {
+        let temp = TempDirGuard::new();
+        let files = vec![
+            file_summary("src/one.rs"),
+            file_summary("src/two.rs"),
+            file_summary("src/three.rs"),
+        ];
+        let mut app = test_app(temp.path.clone(), files);
+        app.focus = Focus::Diff;
+        app.filtered_file_indices = vec![0, 1, 2];
+        app.selected_file_view_idx = 0;
+
+        app.on_key(key_char('n'))
+            .expect("n should move to the next file");
+        assert_eq!(app.selected_file_view_idx, 1);
+
+        app.on_key(key_char('p'))
+            .expect("p should move to the previous file");
+        assert_eq!(app.selected_file_view_idx, 0);
+
+        app.on_key(key_char('p'))
+            .expect("p should wrap to the last file");
+        assert_eq!(app.selected_file_view_idx, 2);
+    }
+
+    #[test]
+    fn highlights_typescript_tokens_with_multiple_colors() {
+        let temp = TempDirGuard::new();
+        let summary = file_summary("src/demo.ts");
+        let app = test_app(temp.path.clone(), vec![summary.clone()]);
+        let patch = app.highlight_patch(FilePatch {
+            summary,
+            metadata: Vec::new(),
+            hunks: vec![crate::model::PatchHunk {
+                header: "@@ -1 +1 @@".to_string(),
+                new_start: 1,
+                lines: vec![PatchLine {
+                    kind: DiffKind::Context,
+                    old_lineno: Some(1),
+                    new_lineno: Some(1),
+                    text: "import { describe } from \"vitest\";".to_string(),
+                }],
+            }],
+        });
+
+        let line_highlights = patch
+            .highlights
+            .first()
+            .expect("highlighted line should exist");
+        let unique_colors: std::collections::HashSet<_> = line_highlights
+            .iter()
+            .map(|segment| segment.style.fg)
+            .collect();
+
+        assert!(
+            unique_colors.len() > 1,
+            "expected syntax highlighting to use multiple colors, got {unique_colors:?}"
+        );
+    }
+
+    #[test]
+    fn comment_editor_line_appends_visible_cursor() {
+        let line = comment_editor_line("review note");
+
+        assert_eq!(line.spans.len(), 2);
+        assert_eq!(line.spans[0].content.as_ref(), "review note");
+        assert_eq!(line.spans[1].content.as_ref(), "▊");
+        assert_eq!(line.spans[1].style.fg, Some(Color::Rgb(216, 180, 84)));
     }
 }
