@@ -53,7 +53,9 @@ pub fn run() -> Result<()> {
 }
 
 fn repository() -> String {
-    env::var("RBA_RELEASE_REPOSITORY").unwrap_or_else(|_| DEFAULT_REPOSITORY.to_string())
+    env::var("REB_RELEASE_REPOSITORY")
+        .or_else(|_| env::var("RBA_RELEASE_REPOSITORY"))
+        .unwrap_or_else(|_| DEFAULT_REPOSITORY.to_string())
 }
 
 fn github_client() -> Result<Client> {
@@ -150,9 +152,9 @@ fn asset_name(tag: &str, platform: &str) -> String {
 
 fn release_platform() -> Result<String> {
     match (env::consts::OS, env::consts::ARCH) {
-        ("macos", "aarch64") => Ok("macos-aarch64".to_string()),
-        ("macos", "x86_64") => Ok("macos-x86_64".to_string()),
-        ("linux", "x86_64") => Ok("linux-x86_64".to_string()),
+        ("macos", "aarch64") => Ok("aarch64-apple-darwin".to_string()),
+        ("macos", "x86_64") => Ok("x86_64-apple-darwin".to_string()),
+        ("linux", "x86_64") => Ok("x86_64-unknown-linux-gnu".to_string()),
         (os, arch) => bail!("unsupported platform: {os}-{arch}"),
     }
 }
@@ -164,8 +166,8 @@ mod tests {
     #[test]
     fn builds_expected_asset_name() {
         assert_eq!(
-            asset_name("v1.2.3", "macos-aarch64"),
-            "reb-v1.2.3-macos-aarch64.tar.gz"
+            asset_name("v1.2.3", "aarch64-apple-darwin"),
+            "reb-v1.2.3-aarch64-apple-darwin.tar.gz"
         );
     }
 

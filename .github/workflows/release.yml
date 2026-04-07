@@ -15,19 +15,18 @@ permissions:
 
 jobs:
   build:
-    name: Build ${{ matrix.platform }}
-    runs-on: ${{ matrix.os }}
-
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            platform: linux-x86_64
-          - os: macos-15-intel
-            platform: macos-x86_64
-          - os: macos-15
-            platform: macos-aarch64
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: macos-15
+            target: aarch64-apple-darwin
 
     steps:
       - name: Checkout
@@ -35,6 +34,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
@@ -43,7 +44,7 @@ jobs:
         run: cargo test --locked
 
       - name: Build release binary
-        run: cargo build --locked --release --bin reb
+        run: cargo build --locked --release --bin reb --target ${{ matrix.target }}
 
       - name: Package archive
         shell: bash
@@ -51,22 +52,21 @@ jobs:
           set -euo pipefail
 
           VERSION="${GITHUB_REF_NAME}"
-          PACKAGE_DIR="dist/reb-${VERSION}-${{ matrix.platform }}"
-          mkdir -p "${PACKAGE_DIR}"
+          TARGET="${{ matrix.target }}"
+          ARCHIVE="reb-${VERSION}-${TARGET}.tar.gz"
 
-          cp target/release/reb "${PACKAGE_DIR}/reb"
-          cp README.md LICENSE "${PACKAGE_DIR}/"
-
-          tar -C dist -czf "${PACKAGE_DIR}.tar.gz" "$(basename "${PACKAGE_DIR}")"
-          shasum -a 256 "${PACKAGE_DIR}.tar.gz" > "${PACKAGE_DIR}.tar.gz.sha256"
+          mkdir -p dist
+          cp "target/${TARGET}/release/reb" dist/reb
+          tar -C dist -czf "${ARCHIVE}" reb
+          shasum -a 256 "${ARCHIVE}" > "${ARCHIVE}.sha256"
 
       - name: Upload packaged artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: release-${{ matrix.platform }}
+          name: release-${{ matrix.target }}
           path: |
-            dist/*.tar.gz
-            dist/*.tar.gz.sha256
+            reb-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+            reb-${{ github.ref_name }}-${{ matrix.target }}.tar.gz.sha256
           if-no-files-found: error
 
   publish:

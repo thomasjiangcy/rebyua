@@ -2,8 +2,8 @@
 
 set -eu
 
-REPOSITORY="${RBA_RELEASE_REPOSITORY:-thomasjiangcy/rebyua}"
-INSTALL_DIR="${RBA_INSTALL_DIR:-/usr/local/bin}"
+REPOSITORY="${REB_RELEASE_REPOSITORY:-${RBA_RELEASE_REPOSITORY:-thomasjiangcy/rebyua}}"
+INSTALL_DIR="${REB_INSTALL_DIR:-${RBA_INSTALL_DIR:-/usr/local/bin}}"
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -37,15 +37,15 @@ platform() {
   os="$(uname -s)"
   arch="$(uname -m)"
 
-  case "${os}:${arch}" in
-    Darwin:arm64)
-      echo "macos-aarch64"
+  case "${os}-${arch}" in
+    Darwin-x86_64)
+      echo "x86_64-apple-darwin"
       ;;
-    Darwin:x86_64)
-      echo "macos-x86_64"
+    Darwin-arm64|Darwin-aarch64)
+      echo "aarch64-apple-darwin"
       ;;
-    Linux:x86_64)
-      echo "linux-x86_64"
+    Linux-x86_64)
+      echo "x86_64-unknown-linux-gnu"
       ;;
     *)
       echo "unsupported platform: ${os}-${arch}" >&2
@@ -87,7 +87,7 @@ trap 'rm -rf "${TMP_DIR}"' EXIT INT TERM
 
 echo "Downloading ${URL}"
 fetch "${URL}" > "${TMP_DIR}/${ARCHIVE}"
-tar -xzf "${TMP_DIR}/${ARCHIVE}" -C "${TMP_DIR}"
+tar -xzf "${TMP_DIR}/${ARCHIVE}" -C "${TMP_DIR}" reb
 
 BINARY_PATH="$(find "${TMP_DIR}" -type f -name reb | head -n 1)"
 [ -n "${BINARY_PATH}" ] || {
