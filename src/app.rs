@@ -212,6 +212,7 @@ impl App {
             KeyCode::Char('G') => self.jump_last(),
             KeyCode::Char('v') => self.toggle_selection(),
             KeyCode::Char('c') => self.open_comment_draft(),
+            KeyCode::Char('C') => self.open_file_comment_draft(),
             KeyCode::Enter if self.focus == Focus::Diff => self.inspect_current_comments(),
             KeyCode::Esc => self.clear_transient_state(),
             KeyCode::Char('/') => self.open_filter_input(),
@@ -938,7 +939,9 @@ impl App {
         } else if self.comment_draft.is_some() {
             Line::from("Comment mode: type to write, Enter to save, Esc to cancel")
         } else {
-            Line::from("h/l focus  j/k move  v select  c comment  Enter inspect  / filter  E copy")
+            Line::from(
+                "h/l focus  j/k move  v select  c line  C file  Enter inspect  / filter  E copy",
+            )
         };
 
         frame.render_widget(Paragraph::new(status), area);
