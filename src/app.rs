@@ -138,6 +138,7 @@ struct App {
     annotations: Vec<Annotation>,
     next_annotation_id: u64,
     notification: Option<Notification>,
+    pending_quit_confirmation: bool,
     should_quit: bool,
     last_diff_inner_height: u16,
     syntax_set: SyntaxSet,
@@ -172,6 +173,7 @@ impl App {
             annotations: Vec::new(),
             next_annotation_id: 1,
             notification: None,
+            pending_quit_confirmation: false,
             should_quit: false,
             last_diff_inner_height: 0,
             syntax_set,
@@ -196,7 +198,7 @@ impl App {
         }
 
         match key.code {
-            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('q') => self.request_or_confirm_quit(),
             KeyCode::Char('h') => self.focus = Focus::Files,
             KeyCode::Char('l') | KeyCode::Enter if self.focus == Focus::Files => {
                 if !self.filtered_file_indices.is_empty() {
@@ -218,6 +220,10 @@ impl App {
             KeyCode::Char('/') => self.open_filter_input(),
             KeyCode::Char('E') => self.export_to_clipboard(),
             _ => {}
+        }
+
+        if !matches!(key.code, KeyCode::Char('q')) {
+            self.pending_quit_confirmation = false;
         }
 
         Ok(())
@@ -571,6 +577,24 @@ impl App {
                 NotificationKind::Error,
             ),
         }
+    }
+
+    fn request_or_confirm_quit(&mut self) {
+        if self.annotations.is_empty() {
+            self.should_quit = true;
+            return;
+        }
+
+        if self.pending_quit_confirmation {
+            self.should_quit = true;
+            return;
+        }
+
+        self.pending_quit_confirmation = true;
+        self.set_notification(
+            "Unsaved in-memory comments will be lost. Press q again to quit.".to_string(),
+            NotificationKind::Error,
+        );
     }
 
     fn expire_notification(&mut self) {
