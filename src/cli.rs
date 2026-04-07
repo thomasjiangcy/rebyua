@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use crate::app;
@@ -17,7 +17,6 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     Review(ReviewArgs),
-    Export(ExportArgs),
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -40,20 +39,11 @@ impl Default for ReviewArgs {
     }
 }
 
-#[derive(clap::Args, Debug)]
-struct ExportArgs {
-    #[arg(long)]
-    stdout: bool,
-}
-
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
         Some(Commands::Review(args)) => app::run(args),
-        Some(Commands::Export(_)) => {
-            bail!("export is available from inside `rebyua review` in the current version")
-        }
         None => app::run(ReviewArgs::default()),
     }
 }
