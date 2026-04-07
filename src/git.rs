@@ -41,13 +41,16 @@ impl ResolvedReview {
             )?
             .trim(),
         );
+        Self::discover_in_root(root, args)
+    }
 
+    fn discover_in_root(root: PathBuf, args: &ReviewArgs) -> Result<Self> {
         if let Some(leaf_branch) = &args.stack {
             let base_branch = resolve_stack_base(&root, &args.base)?;
             let stack = resolve_stack_review(&root, leaf_branch, &base_branch)?;
             let current_edge = stack
                 .edges
-                .last()
+                .first()
                 .cloned()
                 .context("resolved stack contains no review edges")?;
 
@@ -817,6 +820,46 @@ index 1111111..2222222 100644
                 .map(ReviewEdge::label)
                 .collect::<Vec<_>>(),
             vec!["main...feat/a".to_string(), "feat/a...feat/b".to_string()]
+        );
+    }
+
+    #[test]
+    fn stack_review_starts_on_first_edge() {
+        let temp = TempDir::new().expect("tempdir should be created");
+        git(&temp, &["init", "-b", "main"]);
+        git(&temp, &["config", "user.name", "Test User"]);
+        git(&temp, &["config", "user.email", "test@example.com"]);
+
+        commit_file(&temp, "base\n", "base");
+        git(&temp, &["checkout", "-b", "feat/a"]);
+        commit_file(&temp, "base\na\n", "feat a");
+        git(&temp, &["checkout", "-b", "feat/b"]);
+        commit_file(&temp, "base\na\nb\n", "feat b");
+        git(&temp, &["checkout", "-b", "feat/c"]);
+        commit_file(&temp, "base\na\nb\nc\n", "feat c");
+
+        let resolved = ResolvedReview::discover_in_root(
+            temp.path().to_path_buf(),
+            &ReviewArgs {
+                base: "main".to_string(),
+                stack: Some("feat/c".to_string()),
+                ..ReviewArgs::default()
+            },
+        )
+        .expect("stack review should resolve");
+
+        assert_eq!(
+            resolved.repo.current_edge().map(|edge| edge.label()),
+            Some("main...feat/a".to_string())
+        );
+        assert_eq!(
+            resolved
+                .stack
+                .expect("stack review should be present")
+                .edges
+                .first()
+                .map(ReviewEdge::label),
+            Some("main...feat/a".to_string())
         );
     }
 }
