@@ -81,6 +81,10 @@ This checks the latest GitHub release for the current platform and replaces the 
 - `v`: start or lock a line-range selection
 - `c`: comment on the current line or selected range
 - `C`: comment on the current file
+- `Enter`: open or close comments on the current line
+- `F`: select file-level comments for the current file
+- `e`: edit the selected comment
+- `d`: delete the selected comment, with confirmation
 - `/`: search in the diff pane, or filter files when the file list is focused
 - `n` / `p`: jump to next or previous search match
 - `:<line>`: jump to a visible line number in the current diff or file view

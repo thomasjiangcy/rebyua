@@ -136,8 +136,55 @@ struct StyledSegment {
 
 #[derive(Debug, Clone)]
 struct CommentDraft {
-    target: CommentTarget,
+    mode: CommentDraftMode,
     text: String,
+}
+
+impl CommentDraft {
+    fn is_file_comment(&self) -> bool {
+        matches!(
+            self.mode,
+            CommentDraftMode::New(CommentTarget::File)
+                | CommentDraftMode::Edit {
+                    location: CommentDraftLocation::File,
+                    ..
+                }
+        )
+    }
+
+    fn editor_anchor(&self) -> Option<usize> {
+        match self.mode {
+            CommentDraftMode::New(CommentTarget::File) => None,
+            CommentDraftMode::New(CommentTarget::Range(range)) => Some(range.normalized().1),
+            CommentDraftMode::Edit {
+                location: CommentDraftLocation::File,
+                ..
+            } => None,
+            CommentDraftMode::Edit {
+                location: CommentDraftLocation::Line(line_idx),
+                ..
+            } => Some(line_idx),
+        }
+    }
+
+    fn is_editing(&self) -> bool {
+        matches!(self.mode, CommentDraftMode::Edit { .. })
+    }
+}
+
+#[derive(Debug, Clone)]
+enum CommentDraftMode {
+    New(CommentTarget),
+    Edit {
+        annotation_id: u64,
+        location: CommentDraftLocation,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CommentDraftLocation {
+    File,
+    Line(usize),
 }
 
 #[derive(Debug, Clone)]
@@ -150,6 +197,20 @@ struct PromptInput {
 enum CommentTarget {
     File,
     Range(SelectionRange),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommentSelectionTarget {
+    File,
+    Line { line_idx: usize },
+}
+
+#[derive(Debug, Clone)]
+struct CommentSelectionState {
+    target: CommentSelectionTarget,
+    selected_idx: usize,
+    scroll: usize,
+    pending_delete_confirmation: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,6 +265,7 @@ struct App {
     selection: Option<SelectionRange>,
     comment_draft: Option<CommentDraft>,
     expanded_comment_line: Option<usize>,
+    comment_selection: Option<CommentSelectionState>,
     prompt_input: Option<PromptInput>,
     last_search_query: Option<String>,
     filter_query: String,
@@ -250,6 +312,7 @@ impl App {
             selection: None,
             comment_draft: None,
             expanded_comment_line: None,
+            comment_selection: None,
             prompt_input: None,
             last_search_query: None,
             filter_query: String::new(),
@@ -279,6 +342,10 @@ impl App {
         }
 
         if self.handle_comment_input(key)? {
+            return Ok(());
+        }
+
+        if self.handle_comment_selection_input(key)? {
             return Ok(());
         }
 
@@ -317,6 +384,7 @@ impl App {
             KeyCode::Char('v') => self.toggle_selection(),
             KeyCode::Char('c') => self.open_comment_draft(),
             KeyCode::Char('C') => self.open_file_comment_draft(),
+            KeyCode::Char('F') => self.inspect_file_comments(),
             KeyCode::Char('t') => self.toggle_view_mode(),
             KeyCode::Enter if self.focus == Focus::Diff => self.inspect_current_comments(),
             KeyCode::Esc => self.clear_transient_state(),
@@ -424,6 +492,59 @@ impl App {
         }
 
         Ok(true)
+    }
+
+    fn handle_comment_selection_input(&mut self, key: KeyEvent) -> Result<bool> {
+        let Some(selection) = self.comment_selection.as_ref() else {
+            return Ok(false);
+        };
+
+        if selection.pending_delete_confirmation {
+            match key.code {
+                KeyCode::Esc => {
+                    if let Some(selection) = self.comment_selection.as_mut() {
+                        selection.pending_delete_confirmation = false;
+                    }
+                    return Ok(true);
+                }
+                KeyCode::Char('d') | KeyCode::Enter => {
+                    self.delete_selected_comment();
+                    return Ok(true);
+                }
+                _ => {
+                    if let Some(selection) = self.comment_selection.as_mut() {
+                        selection.pending_delete_confirmation = false;
+                    }
+                }
+            }
+        }
+
+        match key.code {
+            KeyCode::Char('j') => {
+                self.move_comment_selection(1);
+                Ok(true)
+            }
+            KeyCode::Char('k') => {
+                self.move_comment_selection(-1);
+                Ok(true)
+            }
+            KeyCode::Char('e') => {
+                self.open_selected_comment_draft();
+                Ok(true)
+            }
+            KeyCode::Char('d') => {
+                let has_selected_comment = self.selected_comment_id().is_some();
+                if let Some(selection) = self.comment_selection.as_mut() {
+                    selection.pending_delete_confirmation = has_selected_comment;
+                }
+                Ok(true)
+            }
+            KeyCode::Esc => {
+                self.close_comment_selection();
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 
     fn move_down(&mut self) {
@@ -604,9 +725,10 @@ impl App {
             cursor: self.diff_cursor,
             locked: true,
         });
+        self.comment_selection = None;
         self.expanded_comment_line = None;
         self.comment_draft = Some(CommentDraft {
-            target: CommentTarget::Range(range),
+            mode: CommentDraftMode::New(CommentTarget::Range(range)),
             text: String::new(),
         });
         self.ensure_cursor_visible();
@@ -619,9 +741,10 @@ impl App {
 
         self.focus = Focus::Diff;
         self.selection = None;
+        self.comment_selection = None;
         self.expanded_comment_line = None;
         self.comment_draft = Some(CommentDraft {
-            target: CommentTarget::File,
+            mode: CommentDraftMode::New(CommentTarget::File),
             text: String::new(),
         });
         self.diff_scroll = 0;
@@ -641,84 +764,105 @@ impl App {
         }
         let current_edge = self.current_review_edge();
 
-        let annotation = match draft.target {
-            CommentTarget::File => Annotation::created_for_file(
-                self.next_annotation_id,
-                summary.path.clone(),
-                current_edge.clone(),
-                body.to_string(),
-            ),
-            CommentTarget::Range(range) => match self.view_mode {
-                DiffViewMode::Patch => {
-                    let patch = self.current_patch().context("missing patch view")?;
-                    let (start, end) = range.normalized();
-                    let start_line = patch.flat_lines.get(start).context("invalid start line")?;
-                    let end_line = patch.flat_lines.get(end).context("invalid end line")?;
-                    let hunk_header = patch
-                        .line_to_hunk
-                        .get(start)
-                        .and_then(|maybe_idx| maybe_idx.and_then(|idx| patch.patch.hunks.get(idx)))
-                        .map(|hunk| hunk.header.clone());
+        match draft.mode {
+            CommentDraftMode::New(CommentTarget::File) => {
+                self.annotations.push(Annotation::created_for_file(
+                    self.next_annotation_id,
+                    summary.path.clone(),
+                    current_edge.clone(),
+                    body.to_string(),
+                ));
+                self.next_annotation_id += 1;
+                self.set_notification("Comment added".to_string(), NotificationKind::Success);
+            }
+            CommentDraftMode::New(CommentTarget::Range(range)) => {
+                let annotation = match self.view_mode {
+                    DiffViewMode::Patch => {
+                        let patch = self.current_patch().context("missing patch view")?;
+                        let (start, end) = range.normalized();
+                        let start_line =
+                            patch.flat_lines.get(start).context("invalid start line")?;
+                        let end_line = patch.flat_lines.get(end).context("invalid end line")?;
+                        let hunk_header = patch
+                            .line_to_hunk
+                            .get(start)
+                            .and_then(|maybe_idx| {
+                                maybe_idx.and_then(|idx| patch.patch.hunks.get(idx))
+                            })
+                            .map(|hunk| hunk.header.clone());
 
-                    Annotation::created_for_lines(
-                        self.next_annotation_id,
-                        summary.path.clone(),
-                        current_edge.clone(),
-                        hunk_header,
-                        AnnotationLineRange {
-                            start_line_idx: start,
-                            end_line_idx: end,
-                            start_ref: LineReference {
-                                old_lineno: start_line.old_lineno,
-                                new_lineno: start_line.new_lineno,
+                        Annotation::created_for_lines(
+                            self.next_annotation_id,
+                            summary.path.clone(),
+                            current_edge.clone(),
+                            hunk_header,
+                            AnnotationLineRange {
+                                start_line_idx: start,
+                                end_line_idx: end,
+                                start_ref: LineReference {
+                                    old_lineno: start_line.old_lineno,
+                                    new_lineno: start_line.new_lineno,
+                                },
+                                end_ref: LineReference {
+                                    old_lineno: end_line.old_lineno,
+                                    new_lineno: end_line.new_lineno,
+                                },
                             },
-                            end_ref: LineReference {
-                                old_lineno: end_line.old_lineno,
-                                new_lineno: end_line.new_lineno,
-                            },
-                        },
-                        body.to_string(),
-                    )
-                }
-                DiffViewMode::File => {
-                    let file = self
-                        .current_whole_file()
-                        .context("missing whole-file view")?;
-                    let (start, end) = range.normalized();
-                    let start_line = file.lines.get(start).context("invalid start line")?;
-                    let end_line = file.lines.get(end).context("invalid end line")?;
-                    let hunk_header = start_line
-                        .hunk_header
-                        .clone()
-                        .or_else(|| end_line.hunk_header.clone());
+                            body.to_string(),
+                        )
+                    }
+                    DiffViewMode::File => {
+                        let file = self
+                            .current_whole_file()
+                            .context("missing whole-file view")?;
+                        let (start, end) = range.normalized();
+                        let start_line = file.lines.get(start).context("invalid start line")?;
+                        let end_line = file.lines.get(end).context("invalid end line")?;
+                        let hunk_header = start_line
+                            .hunk_header
+                            .clone()
+                            .or_else(|| end_line.hunk_header.clone());
 
-                    Annotation::created_for_lines(
-                        self.next_annotation_id,
-                        summary.path.clone(),
-                        current_edge,
-                        hunk_header,
-                        AnnotationLineRange {
-                            start_line_idx: start,
-                            end_line_idx: end,
-                            start_ref: LineReference {
-                                old_lineno: start_line.old_lineno,
-                                new_lineno: start_line.new_lineno,
+                        Annotation::created_for_lines(
+                            self.next_annotation_id,
+                            summary.path.clone(),
+                            current_edge,
+                            hunk_header,
+                            AnnotationLineRange {
+                                start_line_idx: start,
+                                end_line_idx: end,
+                                start_ref: LineReference {
+                                    old_lineno: start_line.old_lineno,
+                                    new_lineno: start_line.new_lineno,
+                                },
+                                end_ref: LineReference {
+                                    old_lineno: end_line.old_lineno,
+                                    new_lineno: end_line.new_lineno,
+                                },
                             },
-                            end_ref: LineReference {
-                                old_lineno: end_line.old_lineno,
-                                new_lineno: end_line.new_lineno,
-                            },
-                        },
-                        body.to_string(),
-                    )
-                }
-            },
-        };
+                            body.to_string(),
+                        )
+                    }
+                };
 
-        self.annotations.push(annotation);
-        self.next_annotation_id += 1;
+                self.annotations.push(annotation);
+                self.next_annotation_id += 1;
+                self.set_notification("Comment added".to_string(), NotificationKind::Success);
+            }
+            CommentDraftMode::Edit { annotation_id, .. } => {
+                let annotation = self
+                    .annotations
+                    .iter_mut()
+                    .find(|annotation| annotation.id == annotation_id)
+                    .context("missing comment to edit")?;
+                annotation.body = body.to_string();
+                self.set_notification("Comment updated".to_string(), NotificationKind::Success);
+            }
+        }
+
         self.selection = None;
-        self.set_notification("Comment added".to_string(), NotificationKind::Success);
+        self.comment_selection = None;
+        self.expanded_comment_line = None;
         Ok(())
     }
 
@@ -731,11 +875,45 @@ impl App {
 
         let matching = self.comment_ids_on_current_line();
         if matching.is_empty() || self.expanded_comment_line == Some(self.diff_cursor) {
-            self.expanded_comment_line = None;
+            self.close_comment_selection();
         } else {
             self.expanded_comment_line = Some(self.diff_cursor);
+            self.comment_selection = Some(CommentSelectionState {
+                target: CommentSelectionTarget::Line {
+                    line_idx: self.diff_cursor,
+                },
+                selected_idx: 0,
+                scroll: 0,
+                pending_delete_confirmation: false,
+            });
             self.ensure_cursor_visible();
         }
+    }
+
+    fn inspect_file_comments(&mut self) {
+        if self.file_comments_for_selected_file().is_empty() {
+            return;
+        }
+
+        self.focus = Focus::Diff;
+        if matches!(
+            self.comment_selection
+                .as_ref()
+                .map(|selection| selection.target),
+            Some(CommentSelectionTarget::File)
+        ) {
+            self.close_comment_selection();
+            return;
+        }
+
+        self.comment_selection = Some(CommentSelectionState {
+            target: CommentSelectionTarget::File,
+            selected_idx: 0,
+            scroll: 0,
+            pending_delete_confirmation: false,
+        });
+        self.expanded_comment_line = None;
+        self.diff_scroll = 0;
     }
 
     fn clear_transient_state(&mut self) {
@@ -743,6 +921,16 @@ impl App {
             self.comment_draft = None;
         } else if self.prompt_input.is_some() {
             self.prompt_input = None;
+        } else if self
+            .comment_selection
+            .as_ref()
+            .is_some_and(|selection| selection.pending_delete_confirmation)
+        {
+            if let Some(selection) = self.comment_selection.as_mut() {
+                selection.pending_delete_confirmation = false;
+            }
+        } else if self.comment_selection.is_some() {
+            self.close_comment_selection();
         } else if self.expanded_comment_line.is_some() {
             self.expanded_comment_line = None;
         } else {
@@ -970,6 +1158,7 @@ impl App {
         self.selection = None;
         self.comment_draft = None;
         self.expanded_comment_line = None;
+        self.comment_selection = None;
         self.prompt_input = None;
         self.last_search_query = None;
         self.notification = None;
@@ -1021,6 +1210,7 @@ impl App {
         self.selection = None;
         self.comment_draft = None;
         self.expanded_comment_line = None;
+        self.comment_selection = None;
 
         match self.view_mode {
             DiffViewMode::Patch => {
@@ -1268,10 +1458,10 @@ impl App {
         };
 
         let has_file_comment_ui = !self.file_comments_for_selected_file().is_empty()
-            || matches!(
-                self.comment_draft.as_ref().map(|draft| draft.target),
-                Some(CommentTarget::File)
-            );
+            || self
+                .comment_draft
+                .as_ref()
+                .is_some_and(CommentDraft::is_file_comment);
 
         if patch.flat_lines.is_empty() && !has_file_comment_ui {
             let message = if patch.patch.metadata.is_empty() {
@@ -1536,14 +1726,16 @@ impl App {
     }
 
     fn render_comment_editor(&self, frame: &mut Frame, area: Rect) {
-        let is_file_comment = matches!(
-            self.comment_draft.as_ref().map(|draft| draft.target),
-            Some(CommentTarget::File)
-        );
-        let title = if is_file_comment {
-            " File Comment  Enter save  Esc cancel "
-        } else {
-            " Comment  Enter save  Esc cancel "
+        let (is_file_comment, is_editing) = self
+            .comment_draft
+            .as_ref()
+            .map(|draft| (draft.is_file_comment(), draft.is_editing()))
+            .unwrap_or((false, false));
+        let title = match (is_file_comment, is_editing) {
+            (true, true) => " Edit File Comment  Enter save  Esc cancel ",
+            (true, false) => " File Comment  Enter save  Esc cancel ",
+            (false, true) => " Edit Comment  Enter save  Esc cancel ",
+            (false, false) => " Comment  Enter save  Esc cancel ",
         };
         let border_color = if is_file_comment {
             Color::Rgb(113, 205, 205)
@@ -1572,55 +1764,68 @@ impl App {
 
     fn render_expanded_comments(&self, frame: &mut Frame, area: Rect, line_idx: usize) {
         let comments = self.comments_on_line(line_idx);
+        let selection = self
+            .comment_selection
+            .as_ref()
+            .filter(|selection| selection.target == CommentSelectionTarget::Line { line_idx });
+        let title = comment_panel_title(
+            "Comments",
+            selection.map(|selection| selection.selected_idx),
+            comments.len(),
+            selection.is_some_and(|selection| selection.pending_delete_confirmation),
+        );
         let block = Block::default()
-            .title(" Comments ")
+            .title(title)
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Rgb(110, 130, 170)));
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        let mut lines = Vec::new();
-        for comment in comments {
-            lines.push(Line::from(vec![
-                Span::styled("• ", Style::default().fg(Color::Yellow)),
-                Span::raw(comment.body.clone()),
-            ]));
-        }
-        if lines.is_empty() {
-            lines.push(Line::from("No comments."));
-        }
-
         frame.render_widget(
-            Paragraph::new(lines)
-                .wrap(Wrap { trim: false })
-                .style(Style::default().fg(Color::White)),
+            Paragraph::new(comment_panel_lines(
+                comments,
+                selection.map(|selection| selection.selected_idx),
+                selection
+                    .map(|selection| selection.scroll)
+                    .unwrap_or_default(),
+                inner.height as usize,
+            ))
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(Color::White)),
             inner,
         );
     }
 
     fn render_file_comments(&self, frame: &mut Frame, area: Rect) {
         let comments = self.file_comments_for_selected_file();
+        let selection = self
+            .comment_selection
+            .as_ref()
+            .filter(|selection| selection.target == CommentSelectionTarget::File);
+        let title = comment_panel_title(
+            "File Comments",
+            selection.map(|selection| selection.selected_idx),
+            comments.len(),
+            selection.is_some_and(|selection| selection.pending_delete_confirmation),
+        );
         let block = Block::default()
-            .title(" File Comments ")
+            .title(title)
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Rgb(110, 130, 170)));
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        let lines: Vec<Line> = comments
-            .into_iter()
-            .map(|comment| {
-                Line::from(vec![
-                    Span::styled("• ", Style::default().fg(Color::Yellow)),
-                    Span::raw(comment.body.clone()),
-                ])
-            })
-            .collect();
-
         frame.render_widget(
-            Paragraph::new(lines)
-                .wrap(Wrap { trim: false })
-                .style(Style::default().fg(Color::White)),
+            Paragraph::new(comment_panel_lines(
+                comments,
+                selection.map(|selection| selection.selected_idx),
+                selection
+                    .map(|selection| selection.scroll)
+                    .unwrap_or_default(),
+                inner.height as usize,
+            ))
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(Color::White)),
             inner,
         );
     }
@@ -1651,13 +1856,21 @@ impl App {
                 label,
                 Style::default().fg(Color::Rgb(160, 196, 255)),
             )])
+        } else if self
+            .comment_selection
+            .as_ref()
+            .is_some_and(|selection| selection.pending_delete_confirmation)
+        {
+            Line::from("Delete comment? Press d or Enter to confirm, Esc to cancel")
+        } else if self.comment_selection.is_some() {
+            Line::from("Comment actions: j/k select, e edit, d delete, Esc close")
         } else if self.comment_draft.is_some() {
             Line::from("Comment mode: type to write, Enter to save, Esc to cancel")
         } else {
             let help = if self.stack_review.is_some() {
-                "h/l focus  j/k move  </> edge  [/] file  / search  n/p next-prev  : line  t toggle  v select  c line  C file  E copy"
+                "h/l focus  j/k move  </> edge  [/] file  / search  n/p next-prev  : line  t toggle  v select  c line  C file  F file-comments  E copy"
             } else {
-                "h/l focus  j/k move  [/] file  / search  n/p next-prev  : line  t toggle  v select  c line  C file  E copy"
+                "h/l focus  j/k move  [/] file  / search  n/p next-prev  : line  t toggle  v select  c line  C file  F file-comments  E copy"
             };
             Line::from(help)
         };
@@ -1692,6 +1905,7 @@ impl App {
             self.selection = None;
             self.comment_draft = None;
             self.expanded_comment_line = None;
+            self.comment_selection = None;
         } else if self.selected_file_view_idx >= self.filtered_file_indices.len() {
             self.selected_file_view_idx = self.filtered_file_indices.len() - 1;
             self.ensure_file_selection_visible();
@@ -1708,6 +1922,7 @@ impl App {
         self.selection = None;
         self.comment_draft = None;
         self.expanded_comment_line = None;
+        self.comment_selection = None;
         self.load_selected_patch();
         if self.view_mode == DiffViewMode::File && !self.load_whole_file_for_selected() {
             self.view_mode = DiffViewMode::Patch;
@@ -1896,17 +2111,14 @@ impl App {
         let mut items = Vec::new();
         let file_comments_count = self.file_comments_for_selected_file().len();
         let show_file_comments = file_comments_count > 0;
-        let file_editor = matches!(
-            self.comment_draft.as_ref().map(|draft| draft.target),
-            Some(CommentTarget::File)
-        );
+        let file_editor = self
+            .comment_draft
+            .as_ref()
+            .is_some_and(CommentDraft::is_file_comment);
         let editor_anchor = self
             .comment_draft
             .as_ref()
-            .and_then(|draft| match draft.target {
-                CommentTarget::File => None,
-                CommentTarget::Range(range) => Some(range.normalized().1),
-            });
+            .and_then(CommentDraft::editor_anchor);
         let expanded_anchor = self.expanded_comment_line.and_then(|line_idx| {
             let comments = self.comments_on_line(line_idx);
             comments
@@ -1984,30 +2196,26 @@ impl App {
                 }
 
                 if let Some(draft) = &self.comment_draft {
-                    match draft.target {
-                        CommentTarget::File => {
-                            editor_end = Some(
-                                items
-                                    .iter()
-                                    .take_while(|item| !matches!(item.kind, DiffItemKind::Line(_)))
-                                    .map(|item| item.height as usize)
-                                    .sum(),
-                            );
-                        }
-                        CommentTarget::Range(range) => {
-                            let anchor = range.normalized().1;
-                            let mut offset = 0usize;
-                            for item in &items {
-                                match item.kind {
-                                    DiffItemKind::Line(line_idx) if line_idx == anchor => {
-                                        offset += 1;
-                                    }
-                                    DiffItemKind::Editor => {
-                                        editor_end = Some(offset + item.height as usize);
-                                        break;
-                                    }
-                                    _ => offset += item.height as usize,
+                    if draft.is_file_comment() {
+                        editor_end = Some(
+                            items
+                                .iter()
+                                .take_while(|item| !matches!(item.kind, DiffItemKind::Line(_)))
+                                .map(|item| item.height as usize)
+                                .sum(),
+                        );
+                    } else if let Some(anchor) = draft.editor_anchor() {
+                        let mut offset = 0usize;
+                        for item in &items {
+                            match item.kind {
+                                DiffItemKind::Line(line_idx) if line_idx == anchor => {
+                                    offset += 1;
                                 }
+                                DiffItemKind::Editor => {
+                                    editor_end = Some(offset + item.height as usize);
+                                    break;
+                                }
+                                _ => offset += item.height as usize,
                             }
                         }
                     }
@@ -2034,13 +2242,12 @@ impl App {
                 let layout = self.whole_file_layout();
                 let line_visual_row = layout.line_row_start(self.diff_cursor.min(file_len - 1));
                 let editor_end = if let Some(draft) = &self.comment_draft {
-                    match draft.target {
-                        CommentTarget::File => {
-                            Some(layout.file_comments_height + COMMENT_BOX_HEIGHT as usize)
-                        }
-                        CommentTarget::Range(range) => Some(
-                            layout.editor_start(range.normalized().1) + COMMENT_BOX_HEIGHT as usize,
-                        ),
+                    if draft.is_file_comment() {
+                        Some(layout.file_comments_height + COMMENT_BOX_HEIGHT as usize)
+                    } else {
+                        draft.editor_anchor().map(|line_idx| {
+                            layout.editor_start(line_idx) + COMMENT_BOX_HEIGHT as usize
+                        })
                     }
                 } else {
                     layout.expanded_anchor.map(|line_idx| {
@@ -2117,17 +2324,14 @@ impl App {
 
     fn whole_file_layout(&self) -> WholeFileLayout {
         let file_comments_count = self.file_comments_for_selected_file().len();
-        let file_editor = matches!(
-            self.comment_draft.as_ref().map(|draft| draft.target),
-            Some(CommentTarget::File)
-        );
+        let file_editor = self
+            .comment_draft
+            .as_ref()
+            .is_some_and(CommentDraft::is_file_comment);
         let editor_anchor = self
             .comment_draft
             .as_ref()
-            .and_then(|draft| match draft.target {
-                CommentTarget::File => None,
-                CommentTarget::Range(range) => Some(range.normalized().1),
-            });
+            .and_then(CommentDraft::editor_anchor);
 
         WholeFileLayout {
             file_comments_height: if file_comments_count > 0 {
@@ -2185,6 +2389,160 @@ impl App {
             .filter(|annotation| annotation.file_path == summary.path)
             .filter(|annotation| self.annotation_matches_line(annotation, old_lineno, new_lineno))
             .collect()
+    }
+
+    fn comment_count_for_target(&self, target: CommentSelectionTarget) -> usize {
+        match target {
+            CommentSelectionTarget::File => self.file_comments_for_selected_file().len(),
+            CommentSelectionTarget::Line { line_idx } => self.comments_on_line(line_idx).len(),
+        }
+    }
+
+    fn comment_capacity_for_target(&self, target: CommentSelectionTarget) -> usize {
+        match target {
+            CommentSelectionTarget::File => {
+                let count = self.file_comments_for_selected_file().len();
+                if count == 0 {
+                    0
+                } else {
+                    file_comments_height(count).saturating_sub(2) as usize
+                }
+            }
+            CommentSelectionTarget::Line { .. } => COMMENT_BOX_HEIGHT.saturating_sub(2) as usize,
+        }
+    }
+
+    fn selected_comment_id(&self) -> Option<u64> {
+        let selection = self.comment_selection.as_ref()?;
+        match selection.target {
+            CommentSelectionTarget::File => self
+                .file_comments_for_selected_file()
+                .get(selection.selected_idx)
+                .map(|annotation| annotation.id),
+            CommentSelectionTarget::Line { line_idx } => self
+                .comments_on_line(line_idx)
+                .get(selection.selected_idx)
+                .map(|annotation| annotation.id),
+        }
+    }
+
+    fn close_comment_selection(&mut self) {
+        if matches!(
+            self.comment_selection
+                .as_ref()
+                .map(|selection| selection.target),
+            Some(CommentSelectionTarget::Line { .. })
+        ) {
+            self.expanded_comment_line = None;
+        }
+        self.comment_selection = None;
+    }
+
+    fn move_comment_selection(&mut self, delta: isize) {
+        let Some(current) = self.comment_selection.as_ref().cloned() else {
+            return;
+        };
+        let count = self.comment_count_for_target(current.target);
+        if count == 0 {
+            self.close_comment_selection();
+            return;
+        }
+
+        let next_idx = if delta >= 0 {
+            (current.selected_idx + 1).min(count - 1)
+        } else {
+            current.selected_idx.saturating_sub(1)
+        };
+        let mut updated = current;
+        updated.selected_idx = next_idx;
+        updated.pending_delete_confirmation = false;
+        self.adjust_comment_selection_scroll(&mut updated, count);
+        self.comment_selection = Some(updated);
+    }
+
+    fn adjust_comment_selection_scroll(
+        &self,
+        selection: &mut CommentSelectionState,
+        comment_count: usize,
+    ) {
+        let capacity = self.comment_capacity_for_target(selection.target);
+        if capacity == 0 || comment_count <= capacity {
+            selection.scroll = 0;
+            return;
+        }
+
+        if selection.selected_idx < selection.scroll {
+            selection.scroll = selection.selected_idx;
+        } else if selection.selected_idx >= selection.scroll + capacity {
+            selection.scroll = selection.selected_idx + 1 - capacity;
+        }
+
+        let max_scroll = comment_count.saturating_sub(capacity);
+        selection.scroll = selection.scroll.min(max_scroll);
+    }
+
+    fn open_selected_comment_draft(&mut self) {
+        let Some(selection) = self.comment_selection.as_ref().cloned() else {
+            return;
+        };
+        let Some(annotation_id) = self.selected_comment_id() else {
+            return;
+        };
+        let Some(body) = self
+            .annotations
+            .iter()
+            .find(|annotation| annotation.id == annotation_id)
+            .map(|annotation| annotation.body.clone())
+        else {
+            return;
+        };
+
+        self.comment_draft = Some(CommentDraft {
+            mode: CommentDraftMode::Edit {
+                annotation_id,
+                location: match selection.target {
+                    CommentSelectionTarget::File => CommentDraftLocation::File,
+                    CommentSelectionTarget::Line { line_idx } => {
+                        CommentDraftLocation::Line(line_idx)
+                    }
+                },
+            },
+            text: body,
+        });
+        self.close_comment_selection();
+        if self
+            .comment_draft
+            .as_ref()
+            .is_some_and(CommentDraft::is_file_comment)
+        {
+            self.diff_scroll = 0;
+        }
+        self.ensure_cursor_visible();
+    }
+
+    fn delete_selected_comment(&mut self) {
+        let Some(selection) = self.comment_selection.as_ref().cloned() else {
+            return;
+        };
+        let Some(annotation_id) = self.selected_comment_id() else {
+            return;
+        };
+
+        self.annotations
+            .retain(|annotation| annotation.id != annotation_id);
+
+        let remaining = self.comment_count_for_target(selection.target);
+        if remaining == 0 {
+            self.close_comment_selection();
+        } else {
+            let mut updated = selection;
+            updated.selected_idx = updated.selected_idx.min(remaining - 1);
+            updated.pending_delete_confirmation = false;
+            self.adjust_comment_selection_scroll(&mut updated, remaining);
+            self.comment_selection = Some(updated);
+        }
+
+        self.set_notification("Comment deleted".to_string(), NotificationKind::Success);
     }
 
     fn annotation_matches_line(
@@ -2484,6 +2842,65 @@ enum DiffItemKind {
 
 fn file_comments_height(comment_count: usize) -> u16 {
     (comment_count as u16 + 2).clamp(3, 6)
+}
+
+fn comment_panel_title(
+    label: &str,
+    selected_idx: Option<usize>,
+    total: usize,
+    pending_delete_confirmation: bool,
+) -> String {
+    if pending_delete_confirmation {
+        format!(" {label}  Delete? d/Enter confirm Esc cancel ")
+    } else if let Some(selected_idx) = selected_idx {
+        format!(
+            " {label} {}/{}  j/k select  e edit  d delete ",
+            selected_idx + 1,
+            total
+        )
+    } else {
+        format!(" {label} ")
+    }
+}
+
+fn comment_panel_lines(
+    comments: Vec<&Annotation>,
+    selected_idx: Option<usize>,
+    scroll: usize,
+    visible_rows: usize,
+) -> Vec<Line<'static>> {
+    if comments.is_empty() {
+        return vec![Line::from("No comments.")];
+    }
+
+    let capacity = visible_rows.max(1);
+    comments
+        .into_iter()
+        .enumerate()
+        .skip(scroll)
+        .take(capacity)
+        .map(|(idx, comment)| {
+            let selected = selected_idx == Some(idx);
+            let marker = if selected { "> " } else { "• " };
+            let text_style = if selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Rgb(208, 221, 255))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let marker_style = if selected {
+                text_style
+            } else {
+                Style::default().fg(Color::Yellow)
+            };
+            Line::from(vec![
+                Span::styled(marker, marker_style),
+                Span::styled(comment.body.clone(), text_style),
+            ])
+        })
+        .collect()
 }
 
 fn truncate_middle(input: &str, max_width: usize) -> String {
@@ -2885,6 +3302,7 @@ mod tests {
             selection: None,
             comment_draft: None,
             expanded_comment_line: None,
+            comment_selection: None,
             prompt_input: None,
             last_search_query: None,
             filter_query: String::new(),
@@ -2916,6 +3334,10 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn key_ctrl(ch: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL)
     }
 
     #[test]
@@ -3010,6 +3432,143 @@ mod tests {
         assert_eq!(annotation.file_path, summary.path);
         assert!(annotation.is_file_level());
         assert_eq!(annotation.body, "needs broader cleanup");
+    }
+
+    #[test]
+    fn edits_selected_line_comment_in_place() {
+        let temp = TempDirGuard::new();
+        let summary = file_summary("src/demo.rs");
+        let mut app = test_app(temp.path.clone(), vec![summary.clone()]);
+        seed_patch(&mut app);
+        app.diff_cursor = 2;
+
+        app.on_key(key_char('c'))
+            .expect("line comment draft should open");
+        for ch in "tighten branch".chars() {
+            app.on_key(key_char(ch))
+                .expect("comment draft input should be accepted");
+        }
+        app.on_key(key(KeyCode::Enter))
+            .expect("comment should be saved");
+
+        app.on_key(key(KeyCode::Enter))
+            .expect("comment panel should open on the current line");
+        assert!(matches!(
+            app.comment_selection
+                .as_ref()
+                .map(|selection| selection.target),
+            Some(CommentSelectionTarget::Line { line_idx: 2 })
+        ));
+
+        app.on_key(key_char('e'))
+            .expect("selected comment should open for editing");
+        assert!(
+            app.comment_draft
+                .as_ref()
+                .is_some_and(CommentDraft::is_editing)
+        );
+
+        app.on_key(key_ctrl('u'))
+            .expect("control-u should clear the draft");
+        for ch in "rewrite branch".chars() {
+            app.on_key(key_char(ch))
+                .expect("edited comment text should be accepted");
+        }
+        app.on_key(key(KeyCode::Enter))
+            .expect("edited comment should save");
+
+        assert_eq!(app.annotations.len(), 1);
+        assert_eq!(app.annotations[0].body, "rewrite branch");
+        assert!(app.comment_selection.is_none());
+        assert!(app.expanded_comment_line.is_none());
+    }
+
+    #[test]
+    fn deleting_comment_requires_confirmation() {
+        let temp = TempDirGuard::new();
+        let summary = file_summary("src/demo.rs");
+        let mut app = test_app(temp.path.clone(), vec![summary.clone()]);
+        seed_patch(&mut app);
+        app.diff_cursor = 2;
+
+        app.on_key(key_char('c'))
+            .expect("line comment draft should open");
+        for ch in "remove me".chars() {
+            app.on_key(key_char(ch))
+                .expect("comment draft input should be accepted");
+        }
+        app.on_key(key(KeyCode::Enter))
+            .expect("comment should be saved");
+
+        app.on_key(key(KeyCode::Enter))
+            .expect("comment panel should open on the current line");
+        app.on_key(key_char('d'))
+            .expect("first delete key should ask for confirmation");
+        assert_eq!(app.annotations.len(), 1);
+        assert!(
+            app.comment_selection
+                .as_ref()
+                .is_some_and(|selection| selection.pending_delete_confirmation)
+        );
+
+        app.on_key(key(KeyCode::Esc))
+            .expect("escape should cancel delete confirmation");
+        assert_eq!(app.annotations.len(), 1);
+        assert!(
+            app.comment_selection
+                .as_ref()
+                .is_some_and(|selection| !selection.pending_delete_confirmation)
+        );
+
+        app.on_key(key_char('d'))
+            .expect("delete key should ask for confirmation again");
+        app.on_key(key(KeyCode::Enter))
+            .expect("enter should confirm deletion");
+
+        assert!(app.annotations.is_empty());
+        assert!(app.comment_selection.is_none());
+        assert!(app.expanded_comment_line.is_none());
+    }
+
+    #[test]
+    fn edits_selected_file_comment() {
+        let temp = TempDirGuard::new();
+        let summary = file_summary("src/demo.rs");
+        let mut app = test_app(temp.path.clone(), vec![summary.clone()]);
+        seed_patch(&mut app);
+
+        app.on_key(key_char('C'))
+            .expect("file comment draft should open");
+        for ch in "needs broader cleanup".chars() {
+            app.on_key(key_char(ch))
+                .expect("file comment input should be accepted");
+        }
+        app.on_key(key(KeyCode::Enter))
+            .expect("file comment should save");
+
+        app.on_key(key_char('F'))
+            .expect("file comments should become selectable");
+        assert!(matches!(
+            app.comment_selection
+                .as_ref()
+                .map(|selection| selection.target),
+            Some(CommentSelectionTarget::File)
+        ));
+
+        app.on_key(key_char('e'))
+            .expect("selected file comment should open for editing");
+        app.on_key(key_ctrl('u'))
+            .expect("control-u should clear the file comment draft");
+        for ch in "needs narrower cleanup".chars() {
+            app.on_key(key_char(ch))
+                .expect("edited file comment text should be accepted");
+        }
+        app.on_key(key(KeyCode::Enter))
+            .expect("edited file comment should save");
+
+        assert_eq!(app.annotations.len(), 1);
+        assert!(app.annotations[0].is_file_level());
+        assert_eq!(app.annotations[0].body, "needs narrower cleanup");
     }
 
     #[test]
