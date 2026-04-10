@@ -322,10 +322,18 @@ fn infer_parent_branch(
         bail!("could not infer a parent branch for {head_branch} before reaching {base_branch}");
     };
 
-    let best_is_same_tip = best.1 == 0;
-    if scored.iter().skip(1).any(|candidate| {
-        (candidate.1 == 0) == best_is_same_tip && candidate.1 == best.1 && candidate.2 == best.2
-    }) {
+    let tied_best_candidates = scored
+        .iter()
+        .filter(|candidate| candidate.1 == best.1 && candidate.2 == best.2)
+        .collect::<Vec<_>>();
+    if tied_best_candidates.len() > 1 {
+        if let Some(base_candidate) = tied_best_candidates
+            .iter()
+            .find(|candidate| candidate.0 == base_branch)
+        {
+            return Ok(base_candidate.0.clone());
+        }
+
         bail!("could not infer a unique parent branch for {head_branch}");
     }
 
@@ -820,6 +828,33 @@ index 1111111..2222222 100644
                 .map(ReviewEdge::label)
                 .collect::<Vec<_>>(),
             vec!["main...feat/a".to_string(), "feat/a...feat/b".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolves_stack_by_preferring_explicit_base_when_parent_candidates_tie() {
+        let temp = TempDir::new().expect("tempdir should be created");
+        git(&temp, &["init", "-b", "main"]);
+        git(&temp, &["config", "user.name", "Test User"]);
+        git(&temp, &["config", "user.email", "test@example.com"]);
+
+        commit_file(&temp, "base\n", "base");
+        git(&temp, &["checkout", "-b", "feat/aws-observability"]);
+        git(&temp, &["checkout", "main"]);
+        git(&temp, &["checkout", "-b", "feat/a"]);
+        commit_file(&temp, "base\na\n", "feat a");
+
+        let stack =
+            resolve_stack_review(temp.path(), "feat/a", "main").expect("stack should resolve");
+
+        assert_eq!(stack.chain, vec!["main".to_string(), "feat/a".to_string()]);
+        assert_eq!(
+            stack
+                .edges
+                .iter()
+                .map(ReviewEdge::label)
+                .collect::<Vec<_>>(),
+            vec!["main...feat/a".to_string()]
         );
     }
 
