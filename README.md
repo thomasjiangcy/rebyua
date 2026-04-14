@@ -4,6 +4,12 @@
 
 The executable is `reb`: a fast terminal UI for reviewing changed files, adding line, range, and file-level comments, and copying a Markdown review back into your agent workflow.
 
+## Screenshot
+
+<p align="center">
+  <img src=".github/assets/rebyua-screenshot.png" alt="rebyua terminal UI" width="1100" />
+</p>
+
 ## Overview
 
 Use `reb` when you want a clean local review pass between agent iterations:
