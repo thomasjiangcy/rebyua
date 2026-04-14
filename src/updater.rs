@@ -1,16 +1,16 @@
 use std::env;
 use std::fs;
+use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path};
 
 use anyhow::{Context, Result, anyhow, bail};
 use flate2::read::GzDecoder;
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, USER_AGENT};
 use serde::Deserialize;
-use tar::Archive;
-use tempfile::tempdir;
+use tar::{Archive, EntryType};
 
 const DEFAULT_REPOSITORY: &str = "thomasjiangcy/rebyua";
 
@@ -95,19 +95,58 @@ fn download_release_binary(client: &Client, asset: &ReleaseAsset) -> Result<Vec<
         .bytes()
         .with_context(|| format!("failed to read {}", asset.name))?;
 
-    let temp = tempdir().context("failed to create temporary directory")?;
-    let archive_path = temp.path().join(&asset.name);
-    fs::write(&archive_path, &bytes).with_context(|| format!("failed to write {}", asset.name))?;
+    binary_from_release_archive(&bytes).with_context(|| format!("failed to unpack {}", asset.name))
+}
 
-    let file =
-        fs::File::open(&archive_path).with_context(|| format!("failed to open {}", asset.name))?;
-    let mut archive = Archive::new(GzDecoder::new(file));
-    archive
-        .unpack(temp.path())
-        .with_context(|| format!("failed to unpack {}", asset.name))?;
+fn binary_from_release_archive(bytes: &[u8]) -> Result<Vec<u8>> {
+    let mut archive = Archive::new(GzDecoder::new(bytes));
+    let mut binary = None;
 
-    let binary_path = find_binary(temp.path())?;
-    fs::read(&binary_path).context("failed to read extracted binary")
+    for entry_result in archive.entries().context("failed to read archive entries")? {
+        let mut entry = entry_result.context("failed to read archive entry")?;
+        let path = entry.path().context("failed to read archive entry path")?;
+        let normalized_path = archive_entry_path(&path)?;
+
+        if normalized_path.as_path() != Path::new("reb") {
+            continue;
+        }
+
+        if entry.header().entry_type() != EntryType::Regular {
+            bail!("release archive contains a non-regular reb entry");
+        }
+
+        if binary.is_some() {
+            bail!("release archive contains multiple reb binaries");
+        }
+
+        let mut extracted = Vec::new();
+        entry
+            .read_to_end(&mut extracted)
+            .context("failed to read reb from archive")?;
+        binary = Some(extracted);
+    }
+
+    binary.ok_or_else(|| anyhow!("release archive does not contain a reb binary"))
+}
+
+fn archive_entry_path(path: &Path) -> Result<std::path::PathBuf> {
+    let mut normalized = std::path::PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                bail!("release archive contains an invalid entry path")
+            }
+        }
+    }
+
+    if normalized.as_os_str().is_empty() {
+        bail!("release archive contains an empty entry path");
+    }
+
+    Ok(normalized)
 }
 
 fn replace_current_executable(current_exe: &Path, downloaded_binary: &[u8]) -> Result<()> {
@@ -124,29 +163,6 @@ fn replace_current_executable(current_exe: &Path, downloaded_binary: &[u8]) -> R
     }
     fs::rename(&temp_target, current_exe).context("failed to replace current executable")?;
     Ok(())
-}
-
-fn find_binary(root: &Path) -> Result<PathBuf> {
-    for entry in walk(root)? {
-        if entry.file_name().is_some_and(|name| name == "reb") && entry.is_file() {
-            return Ok(entry);
-        }
-    }
-    bail!("release archive does not contain a reb binary")
-}
-
-fn walk(root: &Path) -> Result<Vec<PathBuf>> {
-    let mut paths = Vec::new();
-    for entry in fs::read_dir(root).with_context(|| format!("failed to read {}", root.display()))? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            paths.extend(walk(&path)?);
-        } else {
-            paths.push(path);
-        }
-    }
-    Ok(paths)
 }
 
 fn user_agent() -> String {
@@ -169,6 +185,10 @@ fn release_platform() -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Cursor;
+    use tar::{Builder, Header};
 
     #[test]
     fn builds_expected_asset_name() {
@@ -181,5 +201,67 @@ mod tests {
     #[test]
     fn default_repository_is_github_repo_slug() {
         assert_eq!(DEFAULT_REPOSITORY, "thomasjiangcy/rebyua");
+    }
+
+    #[test]
+    fn extracts_reb_binary_without_unpacking_to_disk() {
+        let archive = gzip_tar_archive(&[("reb", b"binary-bytes", EntryType::Regular)]);
+
+        let binary = binary_from_release_archive(&archive).expect("archive should contain reb");
+
+        assert_eq!(binary, b"binary-bytes");
+    }
+
+    #[test]
+    fn rejects_parent_dir_archive_paths() {
+        let err =
+            archive_entry_path(Path::new("../reb")).expect_err("invalid path should fail");
+
+        assert!(err.to_string().contains("invalid entry path"));
+    }
+
+    #[test]
+    fn rejects_non_regular_reb_entries() {
+        let archive = gzip_tar_archive(&[("reb", &[][..], EntryType::Symlink)]);
+
+        let err = binary_from_release_archive(&archive).expect_err("symlink reb should fail");
+
+        assert!(err.to_string().contains("non-regular reb entry"));
+    }
+
+    fn gzip_tar_archive(entries: &[(&str, &[u8], EntryType)]) -> Vec<u8> {
+        let encoder = GzEncoder::new(Vec::new(), Compression::default());
+        let mut builder = Builder::new(encoder);
+
+        for (path, contents, entry_type) in entries {
+            let mut header = Header::new_gnu();
+            header.set_entry_type(*entry_type);
+            header.set_mode(0o755);
+            header.set_mtime(0);
+
+            match entry_type {
+                EntryType::Regular => {
+                    header.set_size(contents.len() as u64);
+                    header.set_cksum();
+                    builder
+                        .append_data(&mut header, *path, Cursor::new(*contents))
+                        .expect("regular entry should append");
+                }
+                _ => {
+                    header.set_size(0);
+                    header.set_cksum();
+                    builder
+                        .append_data(&mut header, *path, Cursor::new(Vec::<u8>::new()))
+                        .expect("non-regular entry should append");
+                }
+            }
+        }
+
+        builder.finish().expect("archive should finish");
+        builder
+            .into_inner()
+            .expect("encoder should be returned")
+            .finish()
+            .expect("gzip stream should finish")
     }
 }
