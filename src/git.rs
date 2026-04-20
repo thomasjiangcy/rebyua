@@ -196,7 +196,7 @@ impl GitRepo {
 
 fn resolve_stack_base(root: &Path, requested_base: &str) -> Result<String> {
     if requested_base != "HEAD" {
-        ensure_local_branch(root, requested_base)?;
+        ensure_ref_exists(root, requested_base)?;
         return Ok(requested_base.to_string());
     }
 
@@ -228,7 +228,7 @@ fn resolve_default_branch(root: &Path) -> Result<Option<String>> {
 
 fn resolve_stack_review(root: &Path, leaf_branch: &str, base_branch: &str) -> Result<StackReview> {
     ensure_local_branch(root, leaf_branch)?;
-    ensure_local_branch(root, base_branch)?;
+    ensure_ref_exists(root, base_branch)?;
 
     let mut current = leaf_branch.to_string();
     let mut reversed_chain = vec![current.clone()];
@@ -269,6 +269,10 @@ fn infer_parent_branch(
     visited: &[String],
 ) -> Result<String> {
     let head_sha = rev_parse(root, head_branch)?;
+    let base_branch_alias = base_branch
+        .rsplit('/')
+        .next()
+        .filter(|alias| *alias != base_branch);
     let mut scored = Vec::new();
     for candidate in local_branches(root)? {
         if candidate == head_branch {
@@ -280,6 +284,9 @@ fn infer_parent_branch(
         }
 
         let candidate_sha = rev_parse(root, &candidate)?;
+        if base_branch_alias.is_some_and(|alias| alias == candidate) {
+            continue;
+        }
         if candidate_sha != head_sha && is_ancestor(root, head_branch, &candidate)? {
             continue;
         }
@@ -312,11 +319,12 @@ fn infer_parent_branch(
     });
 
     let Some(best) = scored.first() else {
-        if base_branch != head_branch
-            && !visited.iter().any(|branch| branch == base_branch)
-            && local_branch_exists(root, base_branch)?
-        {
-            return Ok(base_branch.to_string());
+        if base_branch != head_branch && !visited.iter().any(|branch| branch == base_branch) {
+            if local_branch_exists(root, base_branch)?
+                || is_ancestor(root, base_branch, head_branch)?
+            {
+                return Ok(base_branch.to_string());
+            }
         }
 
         bail!("could not infer a parent branch for {head_branch} before reaching {base_branch}");
@@ -360,6 +368,14 @@ fn ensure_local_branch(root: &Path, branch: &str) -> Result<()> {
     bail!("branch {branch} does not exist locally");
 }
 
+fn ensure_ref_exists(root: &Path, rev: &str) -> Result<()> {
+    if ref_exists(root, rev)? {
+        return Ok(());
+    }
+
+    bail!("ref {rev} does not exist");
+}
+
 fn local_branch_exists(root: &Path, branch: &str) -> Result<bool> {
     let output = Command::new("git")
         .args([
@@ -371,6 +387,15 @@ fn local_branch_exists(root: &Path, branch: &str) -> Result<bool> {
         .current_dir(root)
         .output()
         .with_context(|| format!("failed to check branch {branch}"))?;
+    Ok(output.status.success())
+}
+
+fn ref_exists(root: &Path, rev: &str) -> Result<bool> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", rev])
+        .current_dir(root)
+        .output()
+        .with_context(|| format!("failed to check ref {rev}"))?;
     Ok(output.status.success())
 }
 
@@ -855,6 +880,47 @@ index 1111111..2222222 100644
                 .map(ReviewEdge::label)
                 .collect::<Vec<_>>(),
             vec!["main...feat/a".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolves_stack_against_remote_tracking_base_without_inserting_local_main_edge() {
+        let temp = TempDir::new().expect("tempdir should be created");
+        git(&temp, &["init", "-b", "main"]);
+        git(&temp, &["config", "user.name", "Test User"]);
+        git(&temp, &["config", "user.email", "test@example.com"]);
+
+        commit_file(&temp, "base\n", "base");
+        git(
+            &temp,
+            &["update-ref", "refs/remotes/origin/main", "refs/heads/main"],
+        );
+        git(&temp, &["checkout", "-b", "feat/a"]);
+        commit_file(&temp, "base\na\n", "feat a");
+        git(&temp, &["checkout", "-b", "feat/b"]);
+        commit_file(&temp, "base\na\nb\n", "feat b");
+
+        let stack = resolve_stack_review(temp.path(), "feat/b", "origin/main")
+            .expect("stack should resolve against a remote-tracking base");
+
+        assert_eq!(
+            stack.chain,
+            vec![
+                "origin/main".to_string(),
+                "feat/a".to_string(),
+                "feat/b".to_string()
+            ]
+        );
+        assert_eq!(
+            stack
+                .edges
+                .iter()
+                .map(ReviewEdge::label)
+                .collect::<Vec<_>>(),
+            vec![
+                "origin/main...feat/a".to_string(),
+                "feat/a...feat/b".to_string()
+            ]
         );
     }
 
