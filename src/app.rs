@@ -17,6 +17,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
+use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{FontStyle, Theme, ThemeSet};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
@@ -148,10 +149,14 @@ struct StyledSegment {
 #[derive(Debug, Clone)]
 struct CommentDraft {
     mode: CommentDraftMode,
-    text: String,
+    editor: TextArea<'static>,
 }
 
 impl CommentDraft {
+    fn text(&self) -> String {
+        self.editor.lines().join("\n")
+    }
+
     fn is_file_comment(&self) -> bool {
         matches!(
             self.mode,
@@ -201,7 +206,17 @@ enum CommentDraftLocation {
 #[derive(Debug, Clone)]
 struct PromptInput {
     mode: PromptMode,
-    text: String,
+    editor: TextArea<'static>,
+}
+
+impl PromptInput {
+    fn text(&self) -> &str {
+        self.editor
+            .lines()
+            .first()
+            .map(String::as_str)
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -434,34 +449,33 @@ impl App {
     }
 
     fn handle_prompt_input(&mut self, key: KeyEvent) -> Result<bool> {
-        let Some(prompt) = self.prompt_input.as_mut() else {
+        let Some(mode) = self.prompt_input.as_ref().map(|prompt| prompt.mode) else {
             return Ok(false);
         };
 
-        let mode = prompt.mode;
         let mut submit = false;
         let mut cancel = false;
 
         match key.code {
             KeyCode::Esc => cancel = true,
             KeyCode::Enter => submit = true,
-            KeyCode::Backspace => {
-                prompt.text.pop();
-            }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                prompt.text.clear();
+                if let Some(prompt) = self.prompt_input.as_mut() {
+                    prompt.editor = build_prompt_editor("");
+                }
             }
-            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                prompt.text.push(ch);
+            _ => {
+                if let Some(prompt) = self.prompt_input.as_mut() {
+                    prompt.editor.input(key);
+                }
             }
-            _ => {}
         }
 
         if mode == PromptMode::FileFilter {
             self.filter_query = self
                 .prompt_input
                 .as_ref()
-                .map(|prompt| prompt.text.clone())
+                .map(|prompt| prompt.text().to_string())
                 .unwrap_or_default();
             self.refresh_filtered_files();
         }
@@ -484,24 +498,23 @@ impl App {
     }
 
     fn handle_comment_input(&mut self, key: KeyEvent) -> Result<bool> {
-        let Some(draft) = self.comment_draft.as_mut() else {
+        if self.comment_draft.is_none() {
             return Ok(false);
-        };
+        }
 
         match key.code {
             KeyCode::Esc => self.comment_draft = None,
-            KeyCode::Enter => self.save_comment()?,
-            KeyCode::Backspace => {
-                draft.text.pop();
-            }
+            KeyCode::Enter if key.modifiers.is_empty() => self.save_comment()?,
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                draft.text.clear();
+                if let Some(draft) = self.comment_draft.as_mut() {
+                    draft.editor = build_comment_editor("");
+                }
             }
-            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                draft.text.push(ch);
+            _ => {
+                if let Some(draft) = self.comment_draft.as_mut() {
+                    draft.editor.input(key);
+                }
             }
-            KeyCode::Tab => draft.text.push_str("  "),
-            _ => {}
         }
 
         Ok(true)
@@ -742,7 +755,7 @@ impl App {
         self.expanded_comment_line = None;
         self.comment_draft = Some(CommentDraft {
             mode: CommentDraftMode::New(CommentTarget::Range(range)),
-            text: String::new(),
+            editor: build_comment_editor(""),
         });
         self.ensure_cursor_visible();
     }
@@ -758,7 +771,7 @@ impl App {
         self.expanded_comment_line = None;
         self.comment_draft = Some(CommentDraft {
             mode: CommentDraftMode::New(CommentTarget::File),
-            text: String::new(),
+            editor: build_comment_editor(""),
         });
         self.diff_scroll = 0;
     }
@@ -771,7 +784,8 @@ impl App {
             return Ok(());
         };
 
-        let body = draft.text.trim();
+        let body = draft.text();
+        let body = body.trim();
         if body.is_empty() {
             return Ok(());
         }
@@ -955,13 +969,13 @@ impl App {
         if self.focus == Focus::Diff {
             self.prompt_input = Some(PromptInput {
                 mode: PromptMode::Search,
-                text: String::new(),
+                editor: build_prompt_editor(""),
             });
         } else {
             self.focus = Focus::Files;
             self.prompt_input = Some(PromptInput {
                 mode: PromptMode::FileFilter,
-                text: self.filter_query.clone(),
+                editor: build_prompt_editor(&self.filter_query),
             });
         }
         self.pending_g_prefix = false;
@@ -970,7 +984,7 @@ impl App {
     fn open_line_jump_prompt(&mut self) {
         self.prompt_input = Some(PromptInput {
             mode: PromptMode::JumpLine,
-            text: String::new(),
+            editor: build_prompt_editor(""),
         });
         self.pending_g_prefix = false;
     }
@@ -979,7 +993,7 @@ impl App {
         let query = self
             .prompt_input
             .as_ref()
-            .map(|prompt| prompt.text.trim().to_string())
+            .map(|prompt| prompt.text().trim().to_string())
             .unwrap_or_default();
         if query.is_empty() {
             return;
@@ -995,7 +1009,7 @@ impl App {
         let raw = self
             .prompt_input
             .as_ref()
-            .map(|prompt| prompt.text.trim().to_string())
+            .map(|prompt| prompt.text().trim().to_string())
             .unwrap_or_default();
         let Ok(target) = raw.parse::<usize>() else {
             self.set_notification(
@@ -1362,7 +1376,7 @@ impl App {
     fn render_files(&mut self, frame: &mut Frame, area: Rect) {
         let title = if let Some(prompt) = &self.prompt_input {
             if prompt.mode == PromptMode::FileFilter {
-                format!(" Files /{} ", prompt.text)
+                format!(" Files /{} ", prompt.text())
             } else if self.filter_query.is_empty() {
                 " Files ".to_string()
             } else {
@@ -1768,41 +1782,29 @@ impl App {
         frame.render_widget(Paragraph::new(Line::from(spans)).style(line_style), area);
     }
 
-    fn render_comment_editor(&self, frame: &mut Frame, area: Rect) {
-        let (is_file_comment, is_editing) = self
-            .comment_draft
-            .as_ref()
-            .map(|draft| (draft.is_file_comment(), draft.is_editing()))
-            .unwrap_or((false, false));
+    fn render_comment_editor(&mut self, frame: &mut Frame, area: Rect) {
+        let Some(draft) = self.comment_draft.as_mut() else {
+            return;
+        };
+        let (is_file_comment, is_editing) = (draft.is_file_comment(), draft.is_editing());
         let title = match (is_file_comment, is_editing) {
-            (true, true) => " Edit File Comment  Enter save  Esc cancel ",
-            (true, false) => " File Comment  Enter save  Esc cancel ",
-            (false, true) => " Edit Comment  Enter save  Esc cancel ",
-            (false, false) => " Comment  Enter save  Esc cancel ",
+            (true, true) => " Edit File Comment  Enter save  Shift/Alt+Enter newline  Esc cancel ",
+            (true, false) => " File Comment  Enter save  Shift/Alt+Enter newline  Esc cancel ",
+            (false, true) => " Edit Comment  Enter save  Shift/Alt+Enter newline  Esc cancel ",
+            (false, false) => " Comment  Enter save  Shift/Alt+Enter newline  Esc cancel ",
         };
         let border_color = if is_file_comment {
             Color::Rgb(113, 205, 205)
         } else {
             Color::Rgb(216, 180, 84)
         };
-        let block = Block::default()
-            .title(title)
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(border_color));
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-
-        let draft_text = self
-            .comment_draft
-            .as_ref()
-            .map(|draft| draft.text.as_str())
-            .unwrap_or_default();
-        frame.render_widget(
-            Paragraph::new(comment_editor_line(draft_text))
-                .wrap(Wrap { trim: false })
-                .style(Style::default().fg(Color::White)),
-            inner,
+        draft.editor.set_block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border_color)),
         );
+        frame.render_widget(&draft.editor, area);
     }
 
     fn render_expanded_comments(&self, frame: &mut Frame, area: Rect, line_idx: usize) {
@@ -1873,52 +1875,70 @@ impl App {
         );
     }
 
-    fn render_footer(&self, frame: &mut Frame, area: Rect) {
+    fn render_footer(&mut self, frame: &mut Frame, area: Rect) {
         let metadata = self.footer_metadata();
         let metadata_width = metadata.chars().count().min(area.width as usize) as u16;
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Min(0), Constraint::Length(metadata_width)])
             .split(area);
-        let status = if let Some(notification) = &self.notification {
+        if let Some(notification) = &self.notification {
             let color = match notification.kind {
                 NotificationKind::Success => Color::Rgb(149, 198, 136),
                 NotificationKind::Error => Color::Rgb(224, 110, 110),
             };
-            Line::from(vec![Span::styled(
-                notification.message.clone(),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            )])
-        } else if let Some(prompt) = &self.prompt_input {
-            let label = match prompt.mode {
-                PromptMode::FileFilter => format!("Filtering: {}", prompt.text),
-                PromptMode::Search => format!("Search: /{}", prompt.text),
-                PromptMode::JumpLine => format!("Jump: :{}", prompt.text),
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![Span::styled(
+                    notification.message.clone(),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                )])),
+                chunks[0],
+            );
+        } else if let Some(prompt) = self.prompt_input.as_mut() {
+            let prefix = match prompt.mode {
+                PromptMode::FileFilter => "Filtering: ",
+                PromptMode::Search => "Search: /",
+                PromptMode::JumpLine => "Jump: :",
             };
-            Line::from(vec![Span::styled(
-                label,
-                Style::default().fg(Color::Rgb(160, 196, 255)),
-            )])
+            let prefix_width = prefix.chars().count().min(chunks[0].width as usize) as u16;
+            let prompt_chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Length(prefix_width), Constraint::Min(0)])
+                .split(chunks[0]);
+            frame.render_widget(
+                Paragraph::new(prefix).style(Style::default().fg(Color::Rgb(160, 196, 255))),
+                prompt_chunks[0],
+            );
+            frame.render_widget(&prompt.editor, prompt_chunks[1]);
         } else if self
             .comment_selection
             .as_ref()
             .is_some_and(|selection| selection.pending_delete_confirmation)
         {
-            Line::from("Delete comment? Press d or Enter to confirm, Esc to cancel")
+            frame.render_widget(
+                Paragraph::new("Delete comment? Press d or Enter to confirm, Esc to cancel"),
+                chunks[0],
+            );
         } else if self.comment_selection.is_some() {
-            Line::from("Comment actions: j/k select, e edit, d delete, Esc close")
+            frame.render_widget(
+                Paragraph::new("Comment actions: j/k select, e edit, d delete, Esc close"),
+                chunks[0],
+            );
         } else if self.comment_draft.is_some() {
-            Line::from("Comment mode: type to write, Enter to save, Esc to cancel")
+            frame.render_widget(
+                Paragraph::new(
+                    "Comment mode: Enter saves, Shift/Alt+Enter inserts a newline, Esc cancels",
+                ),
+                chunks[0],
+            );
         } else {
             let help = if self.stack_review.is_some() {
                 "h/l focus  j/k move  </> edge  [/] file  / search  n/p next-prev  : line  t toggle  v select  c line  C file  F file-comments  E copy"
             } else {
                 "h/l focus  j/k move  [/] file  / search  n/p next-prev  : line  t toggle  v select  c line  C file  F file-comments  E copy"
             };
-            Line::from(help)
-        };
-
-        frame.render_widget(Paragraph::new(status), chunks[0]);
+            frame.render_widget(Paragraph::new(help), chunks[0]);
+        }
         frame.render_widget(
             Paragraph::new(metadata).alignment(Alignment::Right),
             chunks[1],
@@ -2483,7 +2503,7 @@ impl App {
                     }
                 },
             },
-            text: body,
+            editor: build_comment_editor(&body),
         });
         self.close_comment_selection();
         if self
@@ -3263,16 +3283,32 @@ fn panel_border(active: bool) -> Style {
     }
 }
 
-fn comment_editor_line(draft_text: &str) -> Line<'static> {
-    let mut spans = Vec::new();
-    if !draft_text.is_empty() {
-        spans.push(Span::raw(draft_text.to_string()));
+fn build_prompt_editor(initial: &str) -> TextArea<'static> {
+    let mut editor = TextArea::new(vec![initial.replace(['\n', '\r'], " ")]);
+    editor.set_style(Style::default().fg(Color::White));
+    editor.set_cursor_line_style(Style::default());
+    editor.set_tab_length(0);
+    editor.move_cursor(CursorMove::End);
+    editor
+}
+
+fn build_comment_editor(initial: &str) -> TextArea<'static> {
+    let mut lines: Vec<String> = initial
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line).to_string())
+        .collect();
+    if lines.is_empty() {
+        lines.push(String::new());
     }
-    spans.push(Span::styled(
-        "▊",
-        Style::default().fg(Color::Rgb(216, 180, 84)),
-    ));
-    Line::from(spans)
+
+    let mut editor = TextArea::new(lines);
+    editor.set_style(Style::default().fg(Color::White));
+    editor.set_cursor_line_style(Style::default());
+    editor.set_tab_length(2);
+    editor.set_wrap_mode(WrapMode::WordOrGlyph);
+    editor.move_cursor(CursorMove::Bottom);
+    editor.move_cursor(CursorMove::End);
+    editor
 }
 
 fn syntax_extension_aliases(extension: &str) -> &'static [&'static str] {
@@ -3444,6 +3480,10 @@ mod tests {
 
     fn key_ctrl(ch: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL)
+    }
+
+    fn key_shift(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::SHIFT)
     }
 
     #[test]
@@ -3839,6 +3879,30 @@ mod tests {
     }
 
     #[test]
+    fn prompt_editor_supports_cursor_motion() {
+        let temp = TempDirGuard::new();
+        let summary = file_summary("src/demo.rs");
+        let mut app = test_app(temp.path.clone(), vec![summary]);
+        seed_patch(&mut app);
+        app.focus = Focus::Diff;
+
+        app.on_key(key_char('/'))
+            .expect("search prompt should open");
+        app.on_key(key_char('a'))
+            .expect("search input should accept the first character");
+        app.on_key(key_char('c'))
+            .expect("search input should accept the second character");
+        app.on_key(key(KeyCode::Left))
+            .expect("left arrow should move within the prompt");
+        app.on_key(key_char('b'))
+            .expect("search input should insert at the cursor");
+        app.on_key(key(KeyCode::Enter))
+            .expect("search should submit");
+
+        assert_eq!(app.last_search_query.as_deref(), Some("abc"));
+    }
+
+    #[test]
     fn line_jump_moves_to_matching_diff_line() {
         let temp = TempDirGuard::new();
         let summary = file_summary("src/demo.rs");
@@ -3856,6 +3920,33 @@ mod tests {
 
         assert!(app.prompt_input.is_none());
         assert_eq!(app.diff_cursor, 3);
+    }
+
+    #[test]
+    fn modified_enter_in_comment_editor_inserts_newline() {
+        let temp = TempDirGuard::new();
+        let summary = file_summary("src/demo.rs");
+        let mut app = test_app(temp.path.clone(), vec![summary.clone()]);
+        seed_patch(&mut app);
+        app.diff_cursor = 2;
+
+        app.on_key(key_char('c'))
+            .expect("line comment draft should open");
+        for ch in "needs".chars() {
+            app.on_key(key_char(ch))
+                .expect("comment draft should accept the first line");
+        }
+        app.on_key(key_shift(KeyCode::Enter))
+            .expect("shift-enter should insert a newline");
+        for ch in "follow-up".chars() {
+            app.on_key(key_char(ch))
+                .expect("comment draft should accept the second line");
+        }
+        app.on_key(key(KeyCode::Enter))
+            .expect("plain enter should save the comment");
+
+        assert_eq!(app.annotations.len(), 1);
+        assert_eq!(app.annotations[0].body, "needs\nfollow-up");
     }
 
     #[test]
@@ -4006,13 +4097,10 @@ mod tests {
     }
 
     #[test]
-    fn comment_editor_line_appends_visible_cursor() {
-        let line = comment_editor_line("review note");
+    fn comment_editor_preserves_existing_multiline_text() {
+        let draft = build_comment_editor("review note\nfollow up");
 
-        assert_eq!(line.spans.len(), 2);
-        assert_eq!(line.spans[0].content.as_ref(), "review note");
-        assert_eq!(line.spans[1].content.as_ref(), "▊");
-        assert_eq!(line.spans[1].style.fg, Some(Color::Rgb(216, 180, 84)));
+        assert_eq!(draft.lines(), ["review note", "follow up"]);
     }
 
     #[test]
