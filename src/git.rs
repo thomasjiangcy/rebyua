@@ -319,12 +319,12 @@ fn infer_parent_branch(
     });
 
     let Some(best) = scored.first() else {
-        if base_branch != head_branch && !visited.iter().any(|branch| branch == base_branch) {
-            if local_branch_exists(root, base_branch)?
-                || is_ancestor(root, base_branch, head_branch)?
-            {
-                return Ok(base_branch.to_string());
-            }
+        if base_branch != head_branch
+            && !visited.iter().any(|branch| branch == base_branch)
+            && (local_branch_exists(root, base_branch)?
+                || is_ancestor(root, base_branch, head_branch)?)
+        {
+            return Ok(base_branch.to_string());
         }
 
         bail!("could not infer a parent branch for {head_branch} before reaching {base_branch}");

@@ -4,6 +4,12 @@
 
 The executable is `reb`: a fast terminal UI for reviewing changed files, adding line, range, and file-level comments, and copying a Markdown review back into your agent workflow.
 
+## Disclosure
+
+This project is currently written 100% by Codex (an AI coding agent), without human-written code contributions.
+
+Do not use this project if you are not comfortable adopting and running code that is fully agent-written.
+
 ## Screenshot
 
 <p align="center">

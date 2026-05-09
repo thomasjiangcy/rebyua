@@ -102,7 +102,10 @@ fn binary_from_release_archive(bytes: &[u8]) -> Result<Vec<u8>> {
     let mut archive = Archive::new(GzDecoder::new(bytes));
     let mut binary = None;
 
-    for entry_result in archive.entries().context("failed to read archive entries")? {
+    for entry_result in archive
+        .entries()
+        .context("failed to read archive entries")?
+    {
         let mut entry = entry_result.context("failed to read archive entry")?;
         let path = entry.path().context("failed to read archive entry path")?;
         let normalized_path = archive_entry_path(&path)?;
@@ -214,8 +217,7 @@ mod tests {
 
     #[test]
     fn rejects_parent_dir_archive_paths() {
-        let err =
-            archive_entry_path(Path::new("../reb")).expect_err("invalid path should fail");
+        let err = archive_entry_path(Path::new("../reb")).expect_err("invalid path should fail");
 
         assert!(err.to_string().contains("invalid entry path"));
     }
