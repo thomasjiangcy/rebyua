@@ -115,10 +115,21 @@ impl GitRepo {
             });
         }
 
+        if self.includes_worktree_untracked_files() {
+            files.extend(self.load_untracked_files()?);
+        }
+
         Ok(files)
     }
 
     pub fn load_patch(&self, summary: &FileSummary) -> Result<FilePatch> {
+        if self.includes_worktree_untracked_files()
+            && matches!(summary.change, ChangeKind::Added)
+            && self.is_untracked_path(&summary.path)?
+        {
+            return self.load_untracked_patch(summary);
+        }
+
         let patch_text = self.run_diff_for_path(
             ["--no-color", "--find-renames", "--unified=3"].as_slice(),
             &summary.path,
@@ -191,6 +202,85 @@ impl GitRepo {
             Some(head) => format!("{}...{}", self.base, head),
             None => self.base.clone(),
         }
+    }
+
+    fn includes_worktree_untracked_files(&self) -> bool {
+        self.head.is_none() && !self.staged
+    }
+
+    fn load_untracked_files(&self) -> Result<Vec<FileSummary>> {
+        let output = self.run_ls_files_others(None)?;
+        Ok(parse_nul_paths(&output)
+            .into_iter()
+            .map(|path| {
+                let added = count_text_lines(&self.root.join(Path::new(&path))).ok();
+                FileSummary {
+                    path,
+                    old_path: None,
+                    added,
+                    deleted: Some(0),
+                    change: ChangeKind::Added,
+                }
+            })
+            .collect())
+    }
+
+    fn is_untracked_path(&self, path: &str) -> Result<bool> {
+        Ok(parse_nul_paths(&self.run_ls_files_others(Some(path))?)
+            .iter()
+            .any(|candidate| candidate == path))
+    }
+
+    fn run_ls_files_others(&self, path: Option<&str>) -> Result<String> {
+        let mut args: Vec<String> = vec![
+            "ls-files".to_string(),
+            "--others".to_string(),
+            "--exclude-standard".to_string(),
+            "-z".to_string(),
+        ];
+        args.push("--".to_string());
+        if !self.pathspecs.is_empty() {
+            args.extend(self.pathspecs.iter().cloned());
+        }
+        if let Some(path) = path {
+            args.push(path.to_string());
+        }
+
+        run_git(
+            &self.root,
+            &args.iter().map(String::as_str).collect::<Vec<_>>(),
+        )
+    }
+
+    fn load_untracked_patch(&self, summary: &FileSummary) -> Result<FilePatch> {
+        let path = self.root.join(Path::new(&summary.path));
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
+                return Ok(FilePatch {
+                    summary: summary.clone(),
+                    hunks: Vec::new(),
+                    metadata: vec!["Binary file not shown.".to_string()],
+                });
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("failed to read {}", path.display()));
+            }
+        };
+
+        let lines = text.lines().collect::<Vec<_>>();
+        let mut patch = String::new();
+        patch.push_str("new file mode 100644\n");
+        if !lines.is_empty() {
+            patch.push_str(&format!("@@ -0,0 +1,{} @@\n", lines.len()));
+            for line in lines {
+                patch.push('+');
+                patch.push_str(line);
+                patch.push('\n');
+            }
+        }
+
+        parse_patch(summary.clone(), &patch)
     }
 }
 
@@ -489,6 +579,18 @@ fn parse_numstat_field(field: &str) -> Option<u64> {
     }
 }
 
+fn parse_nul_paths(input: &str) -> Vec<String> {
+    input
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn count_text_lines(path: &Path) -> Result<u64> {
+    Ok(fs::read_to_string(path)?.lines().count() as u64)
+}
+
 fn parse_change_kind(status: &str) -> ChangeKind {
     match status.chars().next().unwrap_or('M') {
         'A' => ChangeKind::Added,
@@ -744,6 +846,112 @@ index 1111111..2222222 100644
         fs::write(temp.path().join("stack.txt"), contents).expect("file should be written");
         git(temp, &["add", "stack.txt"]);
         git(temp, &["commit", "-m", message]);
+    }
+
+    fn init_repo(temp: &TempDir) {
+        git(temp, &["init", "-b", "main"]);
+        git(temp, &["config", "user.name", "Test User"]);
+        git(temp, &["config", "user.email", "test@example.com"]);
+        commit_file(temp, "base\n", "base");
+    }
+
+    #[test]
+    fn default_worktree_review_includes_untracked_files() {
+        let temp = TempDir::new().expect("tempdir should be created");
+        init_repo(&temp);
+        fs::write(temp.path().join("notes.txt"), "one\ntwo\n").expect("file should be written");
+
+        let repo = GitRepo::for_worktree(
+            temp.path().to_path_buf(),
+            "HEAD".to_string(),
+            false,
+            Vec::new(),
+        );
+        let files = repo.load_files().expect("files should load");
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "notes.txt");
+        assert_eq!(files[0].change, ChangeKind::Added);
+        assert_eq!(files[0].added, Some(2));
+        assert_eq!(files[0].deleted, Some(0));
+    }
+
+    #[test]
+    fn staged_review_does_not_include_untracked_files() {
+        let temp = TempDir::new().expect("tempdir should be created");
+        init_repo(&temp);
+        fs::write(temp.path().join("notes.txt"), "one\n").expect("file should be written");
+
+        let repo = GitRepo::for_worktree(
+            temp.path().to_path_buf(),
+            "HEAD".to_string(),
+            true,
+            Vec::new(),
+        );
+
+        assert!(repo.load_files().expect("files should load").is_empty());
+    }
+
+    #[test]
+    fn untracked_files_obey_pathspecs() {
+        let temp = TempDir::new().expect("tempdir should be created");
+        init_repo(&temp);
+        fs::create_dir(temp.path().join("src")).expect("directory should be created");
+        fs::write(temp.path().join("src/app.rs"), "fn main() {}\n")
+            .expect("file should be written");
+        fs::write(temp.path().join("notes.txt"), "one\n").expect("file should be written");
+
+        let repo = GitRepo::for_worktree(
+            temp.path().to_path_buf(),
+            "HEAD".to_string(),
+            false,
+            vec!["src".to_string()],
+        );
+        let files = repo.load_files().expect("files should load");
+
+        assert_eq!(
+            files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src/app.rs"]
+        );
+    }
+
+    #[test]
+    fn untracked_file_patch_is_synthesized_as_added_lines() {
+        let temp = TempDir::new().expect("tempdir should be created");
+        init_repo(&temp);
+        fs::write(temp.path().join("notes.txt"), "one\ntwo\n").expect("file should be written");
+
+        let repo = GitRepo::for_worktree(
+            temp.path().to_path_buf(),
+            "HEAD".to_string(),
+            false,
+            Vec::new(),
+        );
+        let summary = repo
+            .load_files()
+            .expect("files should load")
+            .into_iter()
+            .next()
+            .expect("untracked file should exist");
+        let patch = repo.load_patch(&summary).expect("patch should load");
+
+        assert_eq!(patch.metadata, vec!["new file mode 100644"]);
+        assert_eq!(patch.hunks.len(), 1);
+        assert_eq!(patch.hunks[0].header, "@@ -0,0 +1,2 @@");
+        assert_eq!(
+            patch.hunks[0]
+                .lines
+                .iter()
+                .map(|line| (line.kind, line.new_lineno, line.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (DiffKind::Add, Some(1), "one"),
+                (DiffKind::Add, Some(2), "two")
+            ]
+        );
     }
 
     #[test]

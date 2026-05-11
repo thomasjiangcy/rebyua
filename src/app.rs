@@ -388,11 +388,11 @@ impl App {
         match key.code {
             KeyCode::Char('q') => self.request_or_confirm_quit(),
             KeyCode::Char('h') => self.focus = Focus::Files,
-            KeyCode::Char('l') | KeyCode::Enter if self.focus == Focus::Files => {
-                if !self.filtered_file_indices.is_empty() {
-                    self.focus = Focus::Diff;
-                    self.load_selected_patch();
-                }
+            KeyCode::Char('l') | KeyCode::Enter
+                if self.focus == Focus::Files && !self.filtered_file_indices.is_empty() =>
+            {
+                self.focus = Focus::Diff;
+                self.load_selected_patch();
             }
             KeyCode::Char(']') => self.move_file_selection(1),
             KeyCode::Char('[') => self.move_file_selection(-1),
