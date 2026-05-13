@@ -12,15 +12,46 @@ use crate::model::{
 #[derive(Debug, Clone)]
 pub struct ResolvedReview {
     pub repo: GitRepo,
-    pub stack: Option<StackReview>,
+    pub sequence: Option<ReviewSequence>,
 }
 
 #[derive(Debug, Clone)]
-pub struct StackReview {
-    pub base_branch: String,
-    pub leaf_branch: String,
+pub struct ReviewSequence {
+    pub kind: ReviewSequenceKind,
+    pub base: String,
+    pub head: String,
     pub chain: Vec<String>,
-    pub edges: Vec<ReviewEdge>,
+    pub items: Vec<ReviewSequenceItem>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewSequenceKind {
+    Stack,
+    Commits,
+}
+
+impl ReviewSequenceKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Stack => "Stack",
+            Self::Commits => "Commit",
+        }
+    }
+
+    pub fn export_mode(self) -> &'static str {
+        match self {
+            Self::Stack => "stack",
+            Self::Commits => "commits",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ReviewSequenceItem {
+    pub edge: ReviewEdge,
+    pub title: String,
+    pub detail: Option<String>,
+    pub diff_mode: DiffMode,
 }
 
 #[derive(Debug, Clone)]
@@ -28,8 +59,15 @@ pub struct GitRepo {
     pub root: PathBuf,
     pub base: String,
     pub head: Option<String>,
+    diff_mode: DiffMode,
     pub staged: bool,
     pub pathspecs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffMode {
+    MergeBase,
+    Direct,
 }
 
 impl ResolvedReview {
@@ -48,21 +86,40 @@ impl ResolvedReview {
         if let Some(leaf_branch) = &args.stack {
             let base_branch = resolve_stack_base(&root, &args.base)?;
             let stack = resolve_stack_review(&root, leaf_branch, &base_branch)?;
-            let current_edge = stack
-                .edges
+            let current_item = stack
+                .items
                 .first()
                 .cloned()
                 .context("resolved stack contains no review edges")?;
 
             return Ok(Self {
-                repo: GitRepo::for_edge(root, current_edge, args.path.clone()),
-                stack: Some(stack),
+                repo: GitRepo::for_sequence_item(root, current_item, args.path.clone()),
+                sequence: Some(stack),
+            });
+        }
+
+        if let Some(commits) = &args.commits {
+            let base = if commits.contains("..") {
+                args.base.clone()
+            } else {
+                resolve_stack_base(&root, &args.base)?
+            };
+            let sequence = resolve_commit_review(&root, commits, &base)?;
+            let current_item = sequence
+                .items
+                .first()
+                .cloned()
+                .context("resolved commit review contains no commits")?;
+
+            return Ok(Self {
+                repo: GitRepo::for_sequence_item(root, current_item, args.path.clone()),
+                sequence: Some(sequence),
             });
         }
 
         Ok(Self {
             repo: GitRepo::for_worktree(root, args.base.clone(), args.staged, args.path.clone()),
-            stack: None,
+            sequence: None,
         })
     }
 }
@@ -73,16 +130,31 @@ impl GitRepo {
             root,
             base,
             head: None,
+            diff_mode: DiffMode::Direct,
             staged,
             pathspecs,
         }
     }
 
-    pub fn for_edge(root: PathBuf, edge: ReviewEdge, pathspecs: Vec<String>) -> Self {
+    pub fn for_sequence_item(
+        root: PathBuf,
+        item: ReviewSequenceItem,
+        pathspecs: Vec<String>,
+    ) -> Self {
+        Self::for_edge_with_mode(root, item.edge, item.diff_mode, pathspecs)
+    }
+
+    fn for_edge_with_mode(
+        root: PathBuf,
+        edge: ReviewEdge,
+        diff_mode: DiffMode,
+        pathspecs: Vec<String>,
+    ) -> Self {
         Self {
             root,
             base: edge.base,
             head: Some(edge.head),
+            diff_mode,
             staged: false,
             pathspecs,
         }
@@ -199,7 +271,10 @@ impl GitRepo {
 
     fn diff_target(&self) -> String {
         match &self.head {
-            Some(head) => format!("{}...{}", self.base, head),
+            Some(head) if self.diff_mode == DiffMode::MergeBase => {
+                format!("{}...{}", self.base, head)
+            }
+            Some(head) => format!("{}..{}", self.base, head),
             None => self.base.clone(),
         }
     }
@@ -316,7 +391,11 @@ fn resolve_default_branch(root: &Path) -> Result<Option<String>> {
     Ok(None)
 }
 
-fn resolve_stack_review(root: &Path, leaf_branch: &str, base_branch: &str) -> Result<StackReview> {
+fn resolve_stack_review(
+    root: &Path,
+    leaf_branch: &str,
+    base_branch: &str,
+) -> Result<ReviewSequence> {
     ensure_local_branch(root, leaf_branch)?;
     ensure_ref_exists(root, base_branch)?;
 
@@ -344,11 +423,88 @@ fn resolve_stack_review(root: &Path, leaf_branch: &str, base_branch: &str) -> Re
         bail!("stack leaf {leaf_branch} is already at base {base_branch}");
     }
 
-    Ok(StackReview {
-        base_branch: base_branch.to_string(),
-        leaf_branch: leaf_branch.to_string(),
+    let items = reversed_edges
+        .iter()
+        .map(|edge| ReviewSequenceItem {
+            edge: edge.clone(),
+            title: edge.label(),
+            detail: None,
+            diff_mode: DiffMode::MergeBase,
+        })
+        .collect();
+
+    Ok(ReviewSequence {
+        kind: ReviewSequenceKind::Stack,
+        base: base_branch.to_string(),
+        head: leaf_branch.to_string(),
         chain: reversed_chain,
-        edges: reversed_edges,
+        items,
+    })
+}
+
+fn resolve_commit_review(
+    root: &Path,
+    requested: &str,
+    requested_base: &str,
+) -> Result<ReviewSequence> {
+    if requested.contains("...") {
+        bail!("commit review ranges must use two-dot syntax: base..head");
+    }
+
+    let (base, head, range) = if let Some((base, head)) = requested.split_once("..") {
+        if base.is_empty() || head.is_empty() {
+            bail!("commit range must use the form base..head");
+        }
+        ensure_ref_exists(root, base)?;
+        ensure_ref_exists(root, head)?;
+        (base.to_string(), head.to_string(), requested.to_string())
+    } else {
+        ensure_ref_exists(root, requested)?;
+        ensure_ref_exists(root, requested_base)?;
+        (
+            requested_base.to_string(),
+            requested.to_string(),
+            format!("{requested_base}..{requested}"),
+        )
+    };
+
+    let commits = run_git(
+        root,
+        ["rev-list", "--reverse", "--first-parent", &range].as_slice(),
+    )?;
+    let commits = commits
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+
+    if commits.is_empty() {
+        bail!("commit review range {range} contains no commits");
+    }
+
+    let mut items = Vec::with_capacity(commits.len());
+    for commit in commits {
+        let parent = first_parent(root, &commit)?;
+        let title = commit_subject(root, &commit)?;
+        let short_sha = short_rev(root, &commit)?;
+        items.push(ReviewSequenceItem {
+            edge: ReviewEdge {
+                base: parent,
+                head: commit,
+            },
+            title,
+            detail: Some(short_sha),
+            diff_mode: DiffMode::Direct,
+        });
+    }
+
+    Ok(ReviewSequence {
+        kind: ReviewSequenceKind::Commits,
+        base,
+        head,
+        chain: Vec::new(),
+        items,
     })
 }
 
@@ -509,6 +665,30 @@ fn rev_list_count(root: &Path, range: &str) -> Result<u64> {
 
 fn rev_parse(root: &Path, rev: &str) -> Result<String> {
     Ok(run_git(root, ["rev-parse", rev].as_slice())?
+        .trim()
+        .to_string())
+}
+
+fn first_parent(root: &Path, rev: &str) -> Result<String> {
+    let output = run_git(root, ["rev-list", "--parents", "-n", "1", rev].as_slice())?;
+    let mut parts = output.split_whitespace();
+    let _commit = parts.next();
+    parts
+        .next()
+        .map(ToString::to_string)
+        .with_context(|| format!("commit {rev} has no parent and cannot be reviewed individually"))
+}
+
+fn commit_subject(root: &Path, rev: &str) -> Result<String> {
+    Ok(
+        run_git(root, ["show", "-s", "--format=%s", rev].as_slice())?
+            .trim()
+            .to_string(),
+    )
+}
+
+fn short_rev(root: &Path, rev: &str) -> Result<String> {
+    Ok(run_git(root, ["rev-parse", "--short", rev].as_slice())?
         .trim()
         .to_string())
 }
@@ -983,9 +1163,9 @@ index 1111111..2222222 100644
         );
         assert_eq!(
             stack
-                .edges
+                .items
                 .iter()
-                .map(ReviewEdge::label)
+                .map(|item| item.edge.label())
                 .collect::<Vec<_>>(),
             vec![
                 "main...feat/a".to_string(),
@@ -1020,9 +1200,9 @@ index 1111111..2222222 100644
         );
         assert_eq!(
             stack
-                .edges
+                .items
                 .iter()
-                .map(ReviewEdge::label)
+                .map(|item| item.edge.label())
                 .collect::<Vec<_>>(),
             vec!["main...feat/a".to_string(), "feat/a...feat/b".to_string()]
         );
@@ -1056,9 +1236,9 @@ index 1111111..2222222 100644
         );
         assert_eq!(
             stack
-                .edges
+                .items
                 .iter()
-                .map(ReviewEdge::label)
+                .map(|item| item.edge.label())
                 .collect::<Vec<_>>(),
             vec!["main...feat/a".to_string(), "feat/a...feat/b".to_string()]
         );
@@ -1083,9 +1263,9 @@ index 1111111..2222222 100644
         assert_eq!(stack.chain, vec!["main".to_string(), "feat/a".to_string()]);
         assert_eq!(
             stack
-                .edges
+                .items
                 .iter()
-                .map(ReviewEdge::label)
+                .map(|item| item.edge.label())
                 .collect::<Vec<_>>(),
             vec!["main...feat/a".to_string()]
         );
@@ -1121,9 +1301,9 @@ index 1111111..2222222 100644
         );
         assert_eq!(
             stack
-                .edges
+                .items
                 .iter()
-                .map(ReviewEdge::label)
+                .map(|item| item.edge.label())
                 .collect::<Vec<_>>(),
             vec![
                 "origin/main...feat/a".to_string(),
@@ -1163,12 +1343,88 @@ index 1111111..2222222 100644
         );
         assert_eq!(
             resolved
-                .stack
+                .sequence
                 .expect("stack review should be present")
-                .edges
+                .items
                 .first()
-                .map(ReviewEdge::label),
+                .map(|item| item.edge.label()),
             Some("main...feat/a".to_string())
+        );
+    }
+
+    #[test]
+    fn resolves_commit_review_from_base_to_head() {
+        let temp = TempDir::new().expect("tempdir should be created");
+        git(&temp, &["init", "-b", "main"]);
+        git(&temp, &["config", "user.name", "Test User"]);
+        git(&temp, &["config", "user.email", "test@example.com"]);
+
+        commit_file(&temp, "base\n", "base");
+        git(&temp, &["checkout", "-b", "feature"]);
+        commit_file(&temp, "base\na\n", "feat a");
+        commit_file(&temp, "base\na\nb\n", "feat b");
+
+        let review =
+            resolve_commit_review(temp.path(), "feature", "main").expect("commits should resolve");
+
+        assert_eq!(review.kind, ReviewSequenceKind::Commits);
+        assert_eq!(review.base, "main");
+        assert_eq!(review.head, "feature");
+        assert_eq!(
+            review
+                .items
+                .iter()
+                .map(|item| item.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["feat a", "feat b"]
+        );
+        assert_eq!(
+            review
+                .items
+                .iter()
+                .map(|item| item.diff_mode)
+                .collect::<Vec<_>>(),
+            vec![DiffMode::Direct, DiffMode::Direct]
+        );
+    }
+
+    #[test]
+    fn commit_review_starts_on_first_commit() {
+        let temp = TempDir::new().expect("tempdir should be created");
+        git(&temp, &["init", "-b", "main"]);
+        git(&temp, &["config", "user.name", "Test User"]);
+        git(&temp, &["config", "user.email", "test@example.com"]);
+
+        commit_file(&temp, "base\n", "base");
+        let base_sha = rev_parse(temp.path(), "HEAD").expect("base sha should resolve");
+        commit_file(&temp, "base\na\n", "feat a");
+        let first_sha = rev_parse(temp.path(), "HEAD").expect("first sha should resolve");
+        commit_file(&temp, "base\na\nb\n", "feat b");
+
+        let resolved = ResolvedReview::discover_in_root(
+            temp.path().to_path_buf(),
+            &ReviewArgs {
+                base: base_sha.clone(),
+                commits: Some("HEAD".to_string()),
+                ..ReviewArgs::default()
+            },
+        )
+        .expect("commit review should resolve");
+
+        assert_eq!(
+            resolved.repo.current_edge(),
+            Some(ReviewEdge {
+                base: base_sha,
+                head: first_sha
+            })
+        );
+        assert_eq!(
+            resolved
+                .sequence
+                .expect("commit review should be present")
+                .items
+                .len(),
+            2
         );
     }
 }
