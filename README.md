@@ -65,6 +65,8 @@ reb review --base origin/main
 reb review --staged
 reb review --path src/app.rs --path src/cli.rs
 reb review --stack feat/c --base origin/main
+reb review --commits --base origin/main
+reb review --commits origin/main..feat/change
 ```
 
 ### Day-to-Day Workflow

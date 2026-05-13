@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use crate::git::{ReviewSequence, ReviewSequenceKind};
 use crate::model::{Annotation, FileSummary, LineReference};
 
 pub fn markdown(base: &str, files: &[FileSummary], annotations: &[Annotation]) -> String {
@@ -43,17 +44,55 @@ pub fn markdown(base: &str, files: &[FileSummary], annotations: &[Annotation]) -
     out
 }
 
-pub fn stack_markdown(
+pub fn sequence_markdown(sequence: &ReviewSequence, annotations: &[Annotation]) -> String {
+    let items = sequence
+        .items
+        .iter()
+        .map(|item| {
+            let heading = match (&item.detail, sequence.kind) {
+                (Some(detail), ReviewSequenceKind::Commits) => format!("{detail} {}", item.title),
+                _ => item.title.clone(),
+            };
+            (item.edge.label(), heading)
+        })
+        .collect::<Vec<_>>();
+
+    let chain = if sequence.kind == ReviewSequenceKind::Stack {
+        Some(sequence.chain.as_slice())
+    } else {
+        None
+    };
+
+    sequence_markdown_parts(
+        sequence.kind.export_mode(),
+        &sequence.base,
+        &sequence.head,
+        chain,
+        &items,
+        annotations,
+    )
+}
+
+fn sequence_markdown_parts(
+    mode: &str,
     base: &str,
-    leaf: &str,
-    chain: &[String],
+    head: &str,
+    chain: Option<&[String]>,
+    items: &[(String, String)],
     annotations: &[Annotation],
 ) -> String {
     let mut out = String::new();
-    out.push_str("- Review mode: `stack`\n");
-    out.push_str(&format!("- Stack base: `{base}`\n"));
-    out.push_str(&format!("- Stack leaf: `{leaf}`\n"));
-    out.push_str(&format!("- Stack chain: `{}`\n", chain.join(" <- ")));
+    out.push_str(&format!("- Review mode: `{mode}`\n"));
+    if mode == "stack" {
+        out.push_str(&format!("- Stack base: `{base}`\n"));
+        out.push_str(&format!("- Stack leaf: `{head}`\n"));
+    } else {
+        out.push_str(&format!("- Base: `{base}`\n"));
+        out.push_str(&format!("- Head: `{head}`\n"));
+    }
+    if let Some(chain) = chain {
+        out.push_str(&format!("- Stack chain: `{}`\n", chain.join(" <- ")));
+    }
     out.push_str(&format!("- Comments: {}\n\n", annotations.len()));
 
     if annotations.is_empty() {
@@ -74,13 +113,12 @@ pub fn stack_markdown(
             .push(annotation);
     }
 
-    for edge in chain.windows(2) {
-        let edge_label = format!("{}...{}", edge[0], edge[1]);
-        let Some(file_groups) = edge_groups.get(&edge_label) else {
+    for (edge_label, heading) in items {
+        let Some(file_groups) = edge_groups.get(edge_label) else {
             continue;
         };
 
-        out.push_str(&format!("## `{edge_label}`\n\n"));
+        out.push_str(&format!("## `{heading}`\n\n"));
         for (file_path, annotations) in file_groups {
             out.push_str(&format!("### {file_path}\n\n"));
             for annotation in annotations {
@@ -244,6 +282,46 @@ mod tests {
 
     #[test]
     fn renders_stack_review_markdown_grouped_by_edge() {
+        let sequence = ReviewSequence {
+            kind: ReviewSequenceKind::Stack,
+            base: "main".to_string(),
+            head: "feat/c".to_string(),
+            chain: vec![
+                "main".to_string(),
+                "feat/a".to_string(),
+                "feat/b".to_string(),
+                "feat/c".to_string(),
+            ],
+            items: vec![
+                crate::git::ReviewSequenceItem {
+                    edge: ReviewEdge {
+                        base: "main".to_string(),
+                        head: "feat/a".to_string(),
+                    },
+                    title: "main...feat/a".to_string(),
+                    detail: None,
+                    diff_mode: crate::git::DiffMode::MergeBase,
+                },
+                crate::git::ReviewSequenceItem {
+                    edge: ReviewEdge {
+                        base: "feat/a".to_string(),
+                        head: "feat/b".to_string(),
+                    },
+                    title: "feat/a...feat/b".to_string(),
+                    detail: None,
+                    diff_mode: crate::git::DiffMode::MergeBase,
+                },
+                crate::git::ReviewSequenceItem {
+                    edge: ReviewEdge {
+                        base: "feat/b".to_string(),
+                        head: "feat/c".to_string(),
+                    },
+                    title: "feat/b...feat/c".to_string(),
+                    detail: None,
+                    diff_mode: crate::git::DiffMode::MergeBase,
+                },
+            ],
+        };
         let annotations = vec![
             Annotation::created_for_file(
                 1,
@@ -278,17 +356,7 @@ mod tests {
             ),
         ];
 
-        let output = stack_markdown(
-            "main",
-            "feat/c",
-            &[
-                "main".to_string(),
-                "feat/a".to_string(),
-                "feat/b".to_string(),
-                "feat/c".to_string(),
-            ],
-            &annotations,
-        );
+        let output = sequence_markdown(&sequence, &annotations);
 
         assert!(output.contains("- Review mode: `stack`"));
         assert!(output.contains("- Stack chain: `main <- feat/a <- feat/b <- feat/c`"));
@@ -297,5 +365,41 @@ mod tests {
         assert!(output.contains("- file: Tighten branch split"));
         assert!(output.contains("## `feat/b...feat/c`"));
         assert!(output.contains("- new 42: Fix edge selection reset"));
+    }
+
+    #[test]
+    fn renders_commit_review_markdown_grouped_by_commit() {
+        let sequence = ReviewSequence {
+            kind: ReviewSequenceKind::Commits,
+            base: "main".to_string(),
+            head: "feature".to_string(),
+            chain: Vec::new(),
+            items: vec![crate::git::ReviewSequenceItem {
+                edge: ReviewEdge {
+                    base: "abc111".to_string(),
+                    head: "def222".to_string(),
+                },
+                title: "feat a".to_string(),
+                detail: Some("def222".to_string()),
+                diff_mode: crate::git::DiffMode::Direct,
+            }],
+        };
+        let annotations = vec![Annotation::created_for_file(
+            1,
+            "src/app.rs".to_string(),
+            Some(ReviewEdge {
+                base: "abc111".to_string(),
+                head: "def222".to_string(),
+            }),
+            "Keep this commit focused".into(),
+        )];
+
+        let output = sequence_markdown(&sequence, &annotations);
+
+        assert!(output.contains("- Review mode: `commits`"));
+        assert!(output.contains("- Base: `main`"));
+        assert!(output.contains("- Head: `feature`"));
+        assert!(output.contains("## `def222 feat a`"));
+        assert!(output.contains("- file: Keep this commit focused"));
     }
 }

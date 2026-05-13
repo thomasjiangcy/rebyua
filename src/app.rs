@@ -25,7 +25,7 @@ use syntect::parsing::{SyntaxReference, SyntaxSet};
 use crate::cli::ReviewArgs;
 use crate::clipboard;
 use crate::export;
-use crate::git::{GitRepo, ResolvedReview, StackReview};
+use crate::git::{GitRepo, ResolvedReview, ReviewSequence};
 use crate::model::{
     Annotation, AnnotationLineRange, ChangeKind, DiffKind, FilePatch, FileSummary, Focus,
     LineReference, PatchLine, ReviewEdge, SelectionRange,
@@ -55,7 +55,7 @@ pub fn run(args: ReviewArgs) -> Result<()> {
     let files = resolved.repo.load_files()?;
     let env_theme = std::env::var("REB_THEME").ok();
     let requested_theme = args.theme.as_deref().or(env_theme.as_deref());
-    let mut app = App::new(resolved.repo, files, resolved.stack, requested_theme)?;
+    let mut app = App::new(resolved.repo, files, resolved.sequence, requested_theme)?;
     let mut terminal = TerminalSession::new()?;
     let mut needs_redraw = true;
 
@@ -273,8 +273,8 @@ enum SearchDirection {
 
 struct App {
     repo: GitRepo,
-    stack_review: Option<StackReview>,
-    current_edge_idx: usize,
+    review_sequence: Option<ReviewSequence>,
+    current_sequence_idx: usize,
     files: Vec<FileSummary>,
     filtered_file_indices: Vec<usize>,
     selected_file_view_idx: usize,
@@ -312,7 +312,7 @@ impl App {
     fn new(
         repo: GitRepo,
         files: Vec<FileSummary>,
-        stack_review: Option<StackReview>,
+        review_sequence: Option<ReviewSequence>,
         requested_theme: Option<&str>,
     ) -> Result<Self> {
         let syntax_set = SyntaxSet::load_defaults_nonewlines();
@@ -321,8 +321,8 @@ impl App {
 
         let mut app = Self {
             repo,
-            current_edge_idx: 0,
-            stack_review,
+            current_sequence_idx: 0,
+            review_sequence,
             files,
             filtered_file_indices: Vec::new(),
             selected_file_view_idx: 0,
@@ -396,8 +396,8 @@ impl App {
             }
             KeyCode::Char(']') => self.move_file_selection(1),
             KeyCode::Char('[') => self.move_file_selection(-1),
-            KeyCode::Char('>') => self.move_stack_edge(1)?,
-            KeyCode::Char('<') => self.move_stack_edge(-1)?,
+            KeyCode::Char('>') => self.move_review_sequence_item(1)?,
+            KeyCode::Char('<') => self.move_review_sequence_item(-1)?,
             KeyCode::Char('n') if self.focus == Focus::Diff => {
                 self.repeat_last_search(SearchDirection::Forward)
             }
@@ -1125,13 +1125,8 @@ impl App {
     }
 
     fn export_to_clipboard(&mut self) {
-        let markdown = if let Some(stack) = &self.stack_review {
-            export::stack_markdown(
-                &stack.base_branch,
-                &stack.leaf_branch,
-                &stack.chain,
-                &self.annotations,
-            )
+        let markdown = if let Some(sequence) = &self.review_sequence {
+            export::sequence_markdown(sequence, &self.annotations)
         } else {
             export::markdown(&self.repo.base, &self.files, &self.annotations)
         };
@@ -1147,15 +1142,15 @@ impl App {
         }
     }
 
-    fn move_stack_edge(&mut self, delta: isize) -> Result<()> {
-        let Some(stack) = &self.stack_review else {
+    fn move_review_sequence_item(&mut self, delta: isize) -> Result<()> {
+        let Some(sequence) = &self.review_sequence else {
             return Ok(());
         };
 
         let next_idx = self
-            .current_edge_idx
+            .current_sequence_idx
             .checked_add_signed(delta)
-            .filter(|idx| *idx < stack.edges.len());
+            .filter(|idx| *idx < sequence.items.len());
         let Some(next_idx) = next_idx else {
             return Ok(());
         };
@@ -1163,13 +1158,14 @@ impl App {
         let preferred_path = self
             .selected_file_summary()
             .map(|summary| summary.path.clone());
-        let edge = stack.edges[next_idx].clone();
-        let repo = GitRepo::for_edge(self.repo.root.clone(), edge, self.repo.pathspecs.clone());
+        let item = sequence.items[next_idx].clone();
+        let repo =
+            GitRepo::for_sequence_item(self.repo.root.clone(), item, self.repo.pathspecs.clone());
         let files = repo.load_files()?;
 
         self.repo = repo;
         self.files = files;
-        self.current_edge_idx = next_idx;
+        self.current_sequence_idx = next_idx;
         self.clear_edge_view_state(preferred_path);
         Ok(())
     }
@@ -1310,7 +1306,7 @@ impl App {
     fn render(&mut self, frame: &mut Frame) {
         let root = Layout::default()
             .direction(Direction::Vertical)
-            .constraints(if self.stack_review.is_some() {
+            .constraints(if self.review_sequence.is_some() {
                 vec![
                     Constraint::Length(STACK_HEADER_HEIGHT),
                     Constraint::Min(1),
@@ -1321,8 +1317,8 @@ impl App {
             })
             .split(frame.area());
 
-        let (body_area, footer_area) = if self.stack_review.is_some() {
-            self.render_stack_header(frame, root[0]);
+        let (body_area, footer_area) = if self.review_sequence.is_some() {
+            self.render_sequence_header(frame, root[0]);
             (root[1], root[2])
         } else {
             (root[0], root[1])
@@ -1345,19 +1341,28 @@ impl App {
         self.render_footer(frame, footer_area);
     }
 
-    fn render_stack_header(&self, frame: &mut Frame, area: Rect) {
-        let Some(stack) = &self.stack_review else {
+    fn render_sequence_header(&self, frame: &mut Frame, area: Rect) {
+        let Some(sequence) = &self.review_sequence else {
             return;
         };
-        let current_edge = stack
-            .edges
-            .get(self.current_edge_idx)
-            .map(ReviewEdge::label)
+        let current_item = sequence.items.get(self.current_sequence_idx);
+        let title = current_item
+            .map(|item| {
+                item.detail
+                    .as_ref()
+                    .map(|detail| format!("{detail} {}", item.title))
+                    .unwrap_or_else(|| item.title.clone())
+            })
             .unwrap_or_default();
-        let progress = format!("Stack {}/{}", self.current_edge_idx + 1, stack.edges.len());
+        let progress = format!(
+            "{} {}/{}",
+            sequence.kind.label(),
+            self.current_sequence_idx + 1,
+            sequence.items.len()
+        );
         let reserved = progress.chars().count() + 2;
         let edge_width = (area.width as usize).saturating_sub(reserved).max(12);
-        let edge_label = truncate_middle(&current_edge, edge_width);
+        let edge_label = truncate_middle(&title, edge_width);
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(progress, Style::default().fg(Color::Rgb(160, 196, 255))),
@@ -1932,7 +1937,7 @@ impl App {
                 chunks[0],
             );
         } else {
-            let help = if self.stack_review.is_some() {
+            let help = if self.review_sequence.is_some() {
                 "h/l focus  j/k move  </> edge  [/] file  / search  n/p next-prev  : line  t toggle  v select  c line  C file  F file-comments  E copy"
             } else {
                 "h/l focus  j/k move  [/] file  / search  n/p next-prev  : line  t toggle  v select  c line  C file  F file-comments  E copy"
@@ -3418,15 +3423,9 @@ mod tests {
 
     fn test_app(root: PathBuf, files: Vec<FileSummary>) -> App {
         App {
-            repo: GitRepo {
-                root,
-                base: "HEAD".to_string(),
-                head: None,
-                staged: false,
-                pathspecs: Vec::new(),
-            },
-            stack_review: None,
-            current_edge_idx: 0,
+            repo: GitRepo::for_worktree(root, "HEAD".to_string(), false, Vec::new()),
+            review_sequence: None,
+            current_sequence_idx: 0,
             files,
             filtered_file_indices: vec![0],
             selected_file_view_idx: 0,

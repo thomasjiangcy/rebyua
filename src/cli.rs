@@ -28,8 +28,17 @@ enum Commands {
 pub struct ReviewArgs {
     #[arg(long, default_value = "HEAD")]
     pub base: String,
-    #[arg(long, value_name = "BRANCH", conflicts_with = "staged")]
+    #[arg(long, value_name = "BRANCH", conflicts_with_all = ["staged", "commits"])]
     pub stack: Option<String>,
+    #[arg(
+        long,
+        value_name = "RANGE_OR_REF",
+        num_args = 0..=1,
+        default_missing_value = "HEAD",
+        conflicts_with_all = ["staged", "stack"],
+        help = "Review each commit in a range or ref since --base"
+    )]
+    pub commits: Option<String>,
     #[arg(
         long,
         value_name = "NAME",
@@ -47,6 +56,7 @@ impl Default for ReviewArgs {
         Self {
             base: "HEAD".to_string(),
             stack: None,
+            commits: None,
             theme: None,
             path: Vec::new(),
             staged: false,
@@ -86,6 +96,7 @@ mod tests {
 
         assert_eq!(args.base, "HEAD");
         assert_eq!(args.stack, None);
+        assert_eq!(args.commits, None);
         assert_eq!(args.theme, None);
         assert!(args.path.is_empty());
         assert!(!args.staged);
@@ -114,6 +125,7 @@ mod tests {
 
         assert_eq!(args.base, "HEAD~2");
         assert_eq!(args.stack, None);
+        assert_eq!(args.commits, None);
         assert_eq!(args.theme.as_deref(), Some("InspiredGitHub"));
         assert_eq!(args.path, vec!["src/app.rs", "src/cli.rs"]);
         assert!(args.staged);
@@ -130,8 +142,34 @@ mod tests {
 
         assert_eq!(args.base, "main");
         assert_eq!(args.stack.as_deref(), Some("feat/c"));
+        assert_eq!(args.commits, None);
         assert_eq!(args.theme, None);
         assert!(!args.staged);
+    }
+
+    #[test]
+    fn parses_commit_review_flag_without_value() {
+        let cli = Cli::try_parse_from(["reb", "review", "--commits", "--base", "main"])
+            .expect("cli should parse");
+
+        let Some(Commands::Review(args)) = cli.command else {
+            panic!("expected review command");
+        };
+
+        assert_eq!(args.base, "main");
+        assert_eq!(args.commits.as_deref(), Some("HEAD"));
+    }
+
+    #[test]
+    fn parses_commit_review_flag_with_range() {
+        let cli = Cli::try_parse_from(["reb", "review", "--commits", "main..feature"])
+            .expect("cli should parse");
+
+        let Some(Commands::Review(args)) = cli.command else {
+            panic!("expected review command");
+        };
+
+        assert_eq!(args.commits.as_deref(), Some("main..feature"));
     }
 
     #[test]
