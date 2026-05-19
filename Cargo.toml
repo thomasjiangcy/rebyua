@@ -21,5 +21,5 @@ ratatui-textarea = "0.9.1"
 reqwest = { version = "0.13.3", default-features = false, features = ["blocking", "json", "rustls"] }
 serde = { version = "1.0.228", features = ["derive"] }
 syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
-tar = "0.4.45"
+tar = "0.4.46"
 tempfile = "3.27.0"
