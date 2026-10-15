@@ -21,7 +21,8 @@ Do not use this project if you are not comfortable adopting and running code tha
 Use `reb` when you want a clean local review pass between agent iterations:
 
 - inspect changed files and diffs in a minimal TUI
-- switch between patch view and whole-file context
+- review the resulting file with removed code collapsed by default
+- reveal removed code inline or switch to a traditional patch view when needed
 - leave comments on a line, a selected range, or an entire file
 - copy the review to your clipboard and paste it straight into your coding agent
 
@@ -92,7 +93,8 @@ This checks the latest GitHub release for the current platform and replaces the 
 - `[` / `]`: jump to previous or next file
 - `gg` / `G`: jump to top or bottom
 - `J` / `K`: jump between hunks
-- `t`: toggle between patch view and whole-file context
+- `r`: reveal or collapse removed lines in the current-file view
+- `t`: toggle between current-file and traditional patch views
 - `v`: start or lock a line-range selection
 - `c`: comment on the current line or selected range
 - `C`: comment on the current file

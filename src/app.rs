@@ -122,7 +122,9 @@ struct HighlightedPatch {
 #[derive(Debug, Clone)]
 struct WholeFileRender {
     lines: Vec<WholeFileLine>,
+    collapsed_lines: Vec<WholeFileLine>,
     hunk_starts: Vec<usize>,
+    collapsed_hunk_starts: Vec<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -132,6 +134,31 @@ struct WholeFileLine {
     text: String,
     diff_kind: Option<DiffKind>,
     hunk_header: Option<String>,
+    collapsed_deletion: Option<CollapsedDeletion>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CollapsedDeletion {
+    old_start: usize,
+    old_end: usize,
+}
+
+impl WholeFileRender {
+    fn visible_lines(&self, show_removed: bool) -> &[WholeFileLine] {
+        if show_removed {
+            &self.lines
+        } else {
+            &self.collapsed_lines
+        }
+    }
+
+    fn visible_hunk_starts(&self, show_removed: bool) -> &[usize] {
+        if show_removed {
+            &self.hunk_starts
+        } else {
+            &self.collapsed_hunk_starts
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -281,6 +308,7 @@ struct App {
     file_list_scroll: usize,
     focus: Focus,
     view_mode: DiffViewMode,
+    show_removed_lines: bool,
     patch_cache: HashMap<String, HighlightedPatch>,
     patch_cache_order: VecDeque<String>,
     patch_highlight_cache: HashMap<String, WholeFileHighlightCache>,
@@ -328,7 +356,8 @@ impl App {
             selected_file_view_idx: 0,
             file_list_scroll: 0,
             focus: Focus::Files,
-            view_mode: DiffViewMode::Patch,
+            view_mode: DiffViewMode::File,
+            show_removed_lines: false,
             patch_cache: HashMap::new(),
             patch_cache_order: VecDeque::new(),
             patch_highlight_cache: HashMap::new(),
@@ -360,6 +389,9 @@ impl App {
             app.focus = Focus::Files;
         } else {
             app.load_selected_patch();
+            if !app.load_whole_file_for_selected() {
+                app.view_mode = DiffViewMode::Patch;
+            }
         }
         Ok(app)
     }
@@ -413,6 +445,7 @@ impl App {
             KeyCode::Char('c') => self.open_comment_draft(),
             KeyCode::Char('C') => self.open_file_comment_draft(),
             KeyCode::Char('F') => self.inspect_file_comments(),
+            KeyCode::Char('r') => self.toggle_removed_lines(),
             KeyCode::Char('t') => self.toggle_view_mode(),
             KeyCode::Enter if self.focus == Focus::Diff => self.inspect_current_comments(),
             KeyCode::Esc => self.clear_transient_state(),
@@ -644,7 +677,7 @@ impl App {
                 .unwrap_or_default(),
             DiffViewMode::File => self
                 .current_whole_file()
-                .map(|file| file.hunk_starts.clone())
+                .map(|file| file.visible_hunk_starts(self.show_removed_lines).to_vec())
                 .unwrap_or_default(),
         };
         if hunk_starts.is_empty() {
@@ -751,6 +784,24 @@ impl App {
             cursor: self.diff_cursor,
             locked: true,
         });
+        if self.view_mode == DiffViewMode::File {
+            let (start, end) = range.normalized();
+            let includes_collapsed_deletion = self
+                .current_whole_file()
+                .map(|file| {
+                    file.visible_lines(self.show_removed_lines)[start..=end]
+                        .iter()
+                        .any(|line| line.collapsed_deletion.is_some())
+                })
+                .unwrap_or(false);
+            if includes_collapsed_deletion {
+                self.set_notification(
+                    "Press r to reveal removed lines before commenting".to_string(),
+                    NotificationKind::Error,
+                );
+                return;
+            }
+        }
         self.comment_selection = None;
         self.expanded_comment_line = None;
         self.comment_draft = Some(CommentDraft {
@@ -842,9 +893,10 @@ impl App {
                         let file = self
                             .current_whole_file()
                             .context("missing whole-file view")?;
+                        let lines = file.visible_lines(self.show_removed_lines);
                         let (start, end) = range.normalized();
-                        let start_line = file.lines.get(start).context("invalid start line")?;
-                        let end_line = file.lines.get(end).context("invalid end line")?;
+                        let start_line = lines.get(start).context("invalid start line")?;
+                        let end_line = lines.get(end).context("invalid end line")?;
                         let hunk_header = start_line
                             .hunk_header
                             .clone()
@@ -1030,21 +1082,16 @@ impl App {
     }
 
     fn jump_to_line_number(&mut self, target: usize) -> bool {
-        let match_line = |old_lineno: Option<usize>, new_lineno: Option<usize>| {
-            new_lineno == Some(target) || old_lineno == Some(target)
-        };
-
         let found = match self.view_mode {
             DiffViewMode::Patch => self.current_patch().and_then(|patch| {
-                patch
-                    .flat_lines
-                    .iter()
-                    .position(|line| match_line(line.old_lineno, line.new_lineno))
+                patch.flat_lines.iter().position(|line| {
+                    line.new_lineno == Some(target) || line.old_lineno == Some(target)
+                })
             }),
             DiffViewMode::File => self.current_whole_file().and_then(|file| {
-                file.lines
+                file.visible_lines(self.show_removed_lines)
                     .iter()
-                    .position(|line| match_line(line.old_lineno, line.new_lineno))
+                    .position(|line| whole_file_line_contains_number(line, target))
             }),
         };
 
@@ -1064,9 +1111,11 @@ impl App {
                     .get(line_idx)
                     .map(|line| line.text.as_str())
             }),
-            DiffViewMode::File => self
-                .current_whole_file()
-                .and_then(|file| file.lines.get(line_idx).map(|line| line.text.as_str())),
+            DiffViewMode::File => self.current_whole_file().and_then(|file| {
+                file.visible_lines(self.show_removed_lines)
+                    .get(line_idx)
+                    .map(|line| line.text.as_str())
+            }),
         }
     }
 
@@ -1186,7 +1235,7 @@ impl App {
         self.prompt_input = None;
         self.last_search_query = None;
         self.notification = None;
-        self.view_mode = DiffViewMode::Patch;
+        self.view_mode = DiffViewMode::File;
         self.refresh_filtered_files();
 
         if let Some(preferred_path) = preferred_path
@@ -1198,6 +1247,11 @@ impl App {
             self.selected_file_view_idx = view_idx;
             self.ensure_file_selection_visible();
             self.reset_diff_view_for_selected_file();
+        } else {
+            self.load_selected_patch();
+            if !self.load_whole_file_for_selected() {
+                self.view_mode = DiffViewMode::Patch;
+            }
         }
     }
 
@@ -1263,9 +1317,15 @@ impl App {
             }
             DiffViewMode::File => {
                 let current_ref = self.current_whole_file().and_then(|file| {
-                    file.lines
+                    file.visible_lines(self.show_removed_lines)
                         .get(self.diff_cursor)
-                        .map(|line| (line.old_lineno, line.new_lineno))
+                        .map(|line| {
+                            if let Some(collapsed) = line.collapsed_deletion {
+                                (Some(collapsed.old_start), None)
+                            } else {
+                                (line.old_lineno, line.new_lineno)
+                            }
+                        })
                 });
                 self.view_mode = DiffViewMode::Patch;
                 if let Some((old_lineno, new_lineno)) = current_ref
@@ -1278,6 +1338,39 @@ impl App {
             }
         }
 
+        self.diff_scroll = 0;
+        self.ensure_cursor_visible();
+    }
+
+    fn toggle_removed_lines(&mut self) {
+        if self.view_mode != DiffViewMode::File {
+            self.set_notification(
+                "Removed lines are always visible in patch view".to_string(),
+                NotificationKind::Error,
+            );
+            return;
+        }
+
+        let current_line = self.current_whole_file().and_then(|file| {
+            file.visible_lines(self.show_removed_lines)
+                .get(self.diff_cursor)
+                .cloned()
+        });
+
+        self.selection = None;
+        self.comment_draft = None;
+        self.expanded_comment_line = None;
+        self.comment_selection = None;
+        self.show_removed_lines = !self.show_removed_lines;
+        for cache in self.whole_file_highlight_cache.values_mut() {
+            cache.lines.clear();
+            cache.line_order.clear();
+        }
+
+        self.diff_cursor = current_line
+            .as_ref()
+            .and_then(|line| self.find_visible_whole_file_line(line))
+            .unwrap_or(0);
         self.diff_scroll = 0;
         self.ensure_cursor_visible();
     }
@@ -1472,7 +1565,8 @@ impl App {
         let title = if let Some(summary) = self.selected_file_summary() {
             let mode = match self.view_mode {
                 DiffViewMode::Patch => "patch",
-                DiffViewMode::File => "file",
+                DiffViewMode::File if self.show_removed_lines => "file · removals shown",
+                DiffViewMode::File => "file · removals hidden",
             };
             format!(" Diff {} [{}] ", summary.path, mode)
         } else {
@@ -1592,7 +1686,10 @@ impl App {
     }
 
     fn render_whole_file_view(&mut self, frame: &mut Frame, inner: Rect) {
-        let Some(file_len) = self.current_whole_file().map(|file| file.lines.len()) else {
+        let Some(file_len) = self
+            .current_whole_file()
+            .map(|file| file.visible_lines(self.show_removed_lines).len())
+        else {
             let empty = Paragraph::new("Whole-file view is unavailable for this selection.")
                 .style(Style::default().fg(Color::DarkGray))
                 .wrap(Wrap { trim: false });
@@ -1728,7 +1825,7 @@ impl App {
     fn render_whole_file_line(&mut self, frame: &mut Frame, area: Rect, line_idx: usize) {
         let Some(line) = self
             .current_whole_file()
-            .and_then(|file| file.lines.get(line_idx))
+            .and_then(|file| file.visible_lines(self.show_removed_lines).get(line_idx))
             .cloned()
         else {
             return;
@@ -1740,7 +1837,11 @@ impl App {
         let has_comments = self.line_has_comments(line_idx);
         let selected = self.focus == Focus::Diff && line_idx == self.diff_cursor;
 
-        let base_style = whole_file_base_style(line.diff_kind);
+        let base_style = if line.collapsed_deletion.is_some() {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            whole_file_base_style(line.diff_kind)
+        };
         let line_style = if selected {
             base_style.bg(diff_cursor_bg())
         } else if in_selection {
@@ -1756,10 +1857,13 @@ impl App {
             Some(DiffKind::Context) => "~",
             None => " ",
         };
-        let old = line
-            .old_lineno
-            .map(|value| format!("{value:>4}"))
-            .unwrap_or_else(|| "    ".to_string());
+        let old = if line.collapsed_deletion.is_some() {
+            "    ".to_string()
+        } else {
+            line.old_lineno
+                .map(|value| format!("{value:>4}"))
+                .unwrap_or_else(|| "    ".to_string())
+        };
         let new = line
             .new_lineno
             .map(|value| format!("{value:>4}"))
@@ -1775,7 +1879,11 @@ impl App {
             Span::raw(" "),
         ];
 
-        let highlighted = self.whole_file_highlights(line_idx);
+        let highlighted = if line.collapsed_deletion.is_some() {
+            Vec::new()
+        } else {
+            self.whole_file_highlights(line_idx)
+        };
         if highlighted.is_empty() {
             spans.push(Span::raw(line.text.clone()));
         } else {
@@ -1938,9 +2046,9 @@ impl App {
             );
         } else {
             let help = if self.review_sequence.is_some() {
-                "h/l focus  j/k move  </> edge  [/] file  / search  n/p next-prev  : line  t toggle  v select  c line  C file  F file-comments  E copy"
+                "h/l focus  j/k move  </> edge  [/] file  / search  n/p next-prev  : line  t view  r removals  v select  c line  C file  F file-comments  E copy"
             } else {
-                "h/l focus  j/k move  [/] file  / search  n/p next-prev  : line  t toggle  v select  c line  C file  F file-comments  E copy"
+                "h/l focus  j/k move  [/] file  / search  n/p next-prev  : line  t view  r removals  v select  c line  C file  F file-comments  E copy"
             };
             frame.render_widget(Paragraph::new(help), chunks[0]);
         }
@@ -2044,6 +2152,11 @@ impl App {
                 self.insert_whole_file_cache(summary.path.clone(), whole);
                 true
             }
+            Ok(None) if patch.patch.summary.change == ChangeKind::Deleted => {
+                let whole = self.build_whole_file_render(patch, "");
+                self.insert_whole_file_cache(summary.path.clone(), whole);
+                true
+            }
             Ok(None) => false,
             Err(err) => {
                 self.set_notification(
@@ -2086,6 +2199,7 @@ impl App {
                 text: line.to_string(),
                 diff_kind: None,
                 hunk_header: None,
+                collapsed_deletion: None,
             })
             .collect();
 
@@ -2104,6 +2218,7 @@ impl App {
                             text: line.text.clone(),
                             diff_kind: Some(DiffKind::Delete),
                             hunk_header: Some(hunk.header.clone()),
+                            collapsed_deletion: None,
                         });
                     }
                     DiffKind::Add | DiffKind::Context => {
@@ -2151,20 +2266,16 @@ impl App {
             }
         }
 
-        let mut hunk_starts = Vec::new();
-        let mut last_hunk_header: Option<String> = None;
-        for (idx, line) in lines.iter().enumerate() {
-            if let Some(header) = &line.hunk_header
-                && last_hunk_header.as_ref() != Some(header)
-            {
-                hunk_starts.push(idx);
-                last_hunk_header = Some(header.clone());
-            } else if line.hunk_header.is_none() {
-                last_hunk_header = None;
-            }
-        }
+        let collapsed_lines = collapse_removed_lines(&lines);
+        let hunk_starts = whole_file_hunk_starts(&lines);
+        let collapsed_hunk_starts = whole_file_hunk_starts(&collapsed_lines);
 
-        WholeFileRender { lines, hunk_starts }
+        WholeFileRender {
+            lines,
+            collapsed_lines,
+            hunk_starts,
+            collapsed_hunk_starts,
+        }
     }
 
     fn patch_layout(&self) -> PatchLayout {
@@ -2234,7 +2345,10 @@ impl App {
                 (line_visual_row, editor_end)
             }
             DiffViewMode::File => {
-                let Some(file_len) = self.current_whole_file().map(|file| file.lines.len()) else {
+                let Some(file_len) = self
+                    .current_whole_file()
+                    .map(|file| file.visible_lines(self.show_removed_lines).len())
+                else {
                     return;
                 };
                 if file_len == 0 {
@@ -2287,7 +2401,7 @@ impl App {
                 .unwrap_or(0),
             DiffViewMode::File => self
                 .current_whole_file()
-                .map(|file| file.lines.len())
+                .map(|file| file.visible_lines(self.show_removed_lines).len())
                 .unwrap_or(0),
         }
     }
@@ -2362,23 +2476,24 @@ impl App {
     }
 
     fn comments_on_line(&self, line_idx: usize) -> Vec<&Annotation> {
-        let line_ref = match self.view_mode {
+        let (old_lineno, new_lineno, collapsed_deletion) = match self.view_mode {
             DiffViewMode::Patch => self.current_patch().and_then(|patch| {
                 patch
                     .flat_lines
                     .get(line_idx)
-                    .map(|line| (line.old_lineno, line.new_lineno))
+                    .map(|line| (line.old_lineno, line.new_lineno, None))
             }),
             DiffViewMode::File => self.current_whole_file().and_then(|file| {
-                file.lines
+                file.visible_lines(self.show_removed_lines)
                     .get(line_idx)
-                    .map(|line| (line.old_lineno, line.new_lineno))
+                    .map(|line| (line.old_lineno, line.new_lineno, line.collapsed_deletion))
             }),
-        };
+        }
+        .unwrap_or((None, None, None));
 
-        let Some((old_lineno, new_lineno)) = line_ref else {
+        if old_lineno.is_none() && new_lineno.is_none() && collapsed_deletion.is_none() {
             return Vec::new();
-        };
+        }
 
         let Some(summary) = self.selected_file_summary() else {
             return Vec::new();
@@ -2388,7 +2503,13 @@ impl App {
             .iter()
             .filter(|annotation| self.annotation_matches_current_edge(annotation))
             .filter(|annotation| annotation.file_path == summary.path)
-            .filter(|annotation| self.annotation_matches_line(annotation, old_lineno, new_lineno))
+            .filter(|annotation| {
+                if let Some(collapsed) = collapsed_deletion {
+                    annotation_overlaps_collapsed_deletion(annotation, collapsed)
+                } else {
+                    self.annotation_matches_line(annotation, old_lineno, new_lineno)
+                }
+            })
             .collect()
     }
 
@@ -2578,15 +2699,30 @@ impl App {
         new_lineno: Option<usize>,
     ) -> Option<usize> {
         self.current_whole_file().and_then(|file| {
-            file.lines.iter().position(|line| {
-                if let Some(new_lineno) = new_lineno {
-                    line.new_lineno == Some(new_lineno)
-                        && (old_lineno.is_none() || line.old_lineno == old_lineno)
-                } else {
-                    old_lineno.is_some() && line.old_lineno == old_lineno
-                }
-            })
+            file.visible_lines(self.show_removed_lines)
+                .iter()
+                .position(|line| {
+                    if let Some(new_lineno) = new_lineno {
+                        line.new_lineno == Some(new_lineno)
+                            && (old_lineno.is_none() || line.old_lineno == old_lineno)
+                    } else {
+                        old_lineno.is_some_and(|old_lineno| {
+                            line.old_lineno == Some(old_lineno)
+                                || line.collapsed_deletion.is_some_and(|collapsed| {
+                                    old_lineno >= collapsed.old_start
+                                        && old_lineno <= collapsed.old_end
+                                })
+                        })
+                    }
+                })
         })
+    }
+
+    fn find_visible_whole_file_line(&self, source: &WholeFileLine) -> Option<usize> {
+        if let Some(collapsed) = source.collapsed_deletion {
+            return self.find_whole_file_line(Some(collapsed.old_start), None);
+        }
+        self.find_whole_file_line(source.old_lineno, source.new_lineno)
     }
 
     fn find_patch_line(
@@ -2672,7 +2808,8 @@ impl App {
         let Some(file) = self.whole_file_cache.get(&path) else {
             return Vec::new();
         };
-        if line_idx >= file.lines.len() {
+        let visible_lines = file.visible_lines(self.show_removed_lines);
+        if line_idx >= visible_lines.len() {
             return Vec::new();
         }
 
@@ -2685,7 +2822,7 @@ impl App {
             return segments;
         }
 
-        let Some(line_text) = file.lines.get(line_idx).map(|line| line.text.clone()) else {
+        let Some(line_text) = visible_lines.get(line_idx).map(|line| line.text.clone()) else {
             return Vec::new();
         };
         let segments = if should_syntax_highlight_line(&line_text) {
@@ -2945,6 +3082,90 @@ impl WholeFileLayout {
         };
         editor_rows + expanded_rows
     }
+}
+
+fn collapse_removed_lines(lines: &[WholeFileLine]) -> Vec<WholeFileLine> {
+    let mut collapsed = Vec::with_capacity(lines.len());
+    let mut idx = 0;
+
+    while idx < lines.len() {
+        if lines[idx].diff_kind != Some(DiffKind::Delete) {
+            collapsed.push(lines[idx].clone());
+            idx += 1;
+            continue;
+        }
+
+        let start = idx;
+        let hunk_header = lines[idx].hunk_header.clone();
+        while idx < lines.len()
+            && lines[idx].diff_kind == Some(DiffKind::Delete)
+            && lines[idx].hunk_header == hunk_header
+        {
+            idx += 1;
+        }
+
+        let removed = &lines[start..idx];
+        let count = removed.len();
+        let old_start = removed
+            .iter()
+            .filter_map(|line| line.old_lineno)
+            .min()
+            .unwrap_or(0);
+        let old_end = removed
+            .iter()
+            .filter_map(|line| line.old_lineno)
+            .max()
+            .unwrap_or(old_start);
+        let noun = if count == 1 { "line" } else { "lines" };
+
+        collapsed.push(WholeFileLine {
+            old_lineno: None,
+            new_lineno: None,
+            text: format!("⋯ {count} removed {noun} · press r to reveal"),
+            diff_kind: Some(DiffKind::Delete),
+            hunk_header,
+            collapsed_deletion: Some(CollapsedDeletion { old_start, old_end }),
+        });
+    }
+
+    collapsed
+}
+
+fn whole_file_hunk_starts(lines: &[WholeFileLine]) -> Vec<usize> {
+    let mut hunk_starts = Vec::new();
+    let mut last_hunk_header: Option<String> = None;
+    for (idx, line) in lines.iter().enumerate() {
+        if let Some(header) = &line.hunk_header
+            && last_hunk_header.as_ref() != Some(header)
+        {
+            hunk_starts.push(idx);
+            last_hunk_header = Some(header.clone());
+        } else if line.hunk_header.is_none() {
+            last_hunk_header = None;
+        }
+    }
+    hunk_starts
+}
+
+fn whole_file_line_contains_number(line: &WholeFileLine, target: usize) -> bool {
+    line.new_lineno == Some(target)
+        || line.old_lineno == Some(target)
+        || line
+            .collapsed_deletion
+            .is_some_and(|collapsed| target >= collapsed.old_start && target <= collapsed.old_end)
+}
+
+fn annotation_overlaps_collapsed_deletion(
+    annotation: &Annotation,
+    collapsed: CollapsedDeletion,
+) -> bool {
+    let Some((start_ref, end_ref)) = annotation.line_refs() else {
+        return false;
+    };
+    let (Some(start), Some(end)) = (start_ref.old_lineno, end_ref.old_lineno) else {
+        return false;
+    };
+    start.min(end) <= collapsed.old_end && start.max(end) >= collapsed.old_start
 }
 
 fn file_comments_height(comment_count: usize) -> u16 {
@@ -3432,6 +3653,7 @@ mod tests {
             file_list_scroll: 0,
             focus: Focus::Diff,
             view_mode: DiffViewMode::Patch,
+            show_removed_lines: false,
             patch_cache: HashMap::new(),
             patch_cache_order: VecDeque::new(),
             patch_highlight_cache: HashMap::new(),
@@ -3774,6 +3996,76 @@ mod tests {
             .expect("toggle back to patch view should succeed");
         assert_eq!(app.view_mode, DiffViewMode::Patch);
         assert_eq!(app.diff_cursor, 2);
+    }
+
+    #[test]
+    fn whole_file_view_collapses_and_reveals_removed_lines() {
+        let temp = TempDirGuard::new();
+        let summary = file_summary("src/demo.rs");
+        let full_path = temp.path.join(&summary.path);
+        fs::create_dir_all(full_path.parent().expect("parent should exist"))
+            .expect("parent directories should be created");
+        fs::write(&full_path, sample_file_text()).expect("sample file should be written");
+
+        let mut app = test_app(temp.path.clone(), vec![summary]);
+        seed_patch(&mut app);
+        assert!(app.load_whole_file_for_selected());
+        app.view_mode = DiffViewMode::File;
+
+        let hidden_lines = app
+            .current_whole_file()
+            .expect("whole-file view should exist")
+            .visible_lines(false);
+        assert_eq!(hidden_lines[1].text, "⋯ 1 removed line · press r to reveal");
+        assert!(hidden_lines[1].collapsed_deletion.is_some());
+        assert!(
+            !hidden_lines
+                .iter()
+                .any(|line| line.text.contains("value = 1"))
+        );
+
+        app.diff_cursor = 1;
+        app.on_key(key_char('r'))
+            .expect("removed lines should be revealed");
+        assert!(app.show_removed_lines);
+        let revealed = app
+            .current_whole_file()
+            .expect("whole-file view should exist")
+            .visible_lines(true);
+        assert_eq!(revealed[app.diff_cursor].text, "    let value = 1;");
+
+        app.on_key(key_char('r'))
+            .expect("removed lines should collapse again");
+        assert!(!app.show_removed_lines);
+        let collapsed = app
+            .current_whole_file()
+            .expect("whole-file view should exist")
+            .visible_lines(false);
+        assert!(collapsed[app.diff_cursor].collapsed_deletion.is_some());
+    }
+
+    #[test]
+    fn collapsed_removal_must_be_revealed_before_commenting() {
+        let temp = TempDirGuard::new();
+        let summary = file_summary("src/demo.rs");
+        let full_path = temp.path.join(&summary.path);
+        fs::create_dir_all(full_path.parent().expect("parent should exist"))
+            .expect("parent directories should be created");
+        fs::write(&full_path, sample_file_text()).expect("sample file should be written");
+
+        let mut app = test_app(temp.path.clone(), vec![summary]);
+        seed_patch(&mut app);
+        assert!(app.load_whole_file_for_selected());
+        app.view_mode = DiffViewMode::File;
+        app.diff_cursor = 1;
+
+        app.on_key(key_char('c'))
+            .expect("comment attempt should be handled");
+
+        assert!(app.comment_draft.is_none());
+        assert!(app.notification.as_ref().is_some_and(|notification| {
+            notification.message == "Press r to reveal removed lines before commenting"
+        }));
     }
 
     #[test]
@@ -4241,8 +4533,18 @@ mod tests {
                         text: "const value = 1;".to_string(),
                         diff_kind: None,
                         hunk_header: None,
+                        collapsed_deletion: None,
+                    }],
+                    collapsed_lines: vec![WholeFileLine {
+                        old_lineno: Some(1),
+                        new_lineno: Some(1),
+                        text: "const value = 1;".to_string(),
+                        diff_kind: None,
+                        hunk_header: None,
+                        collapsed_deletion: None,
                     }],
                     hunk_starts: vec![0],
+                    collapsed_hunk_starts: vec![0],
                 },
             );
         }
@@ -4347,10 +4649,19 @@ mod tests {
                 } else {
                     None
                 },
+                collapsed_deletion: None,
             })
             .collect();
-        let hunk_starts = (0..line_count).step_by(200).collect();
-        app.insert_whole_file_cache(summary.path.clone(), WholeFileRender { lines, hunk_starts });
+        let hunk_starts = (0..line_count).step_by(200).collect::<Vec<_>>();
+        app.insert_whole_file_cache(
+            summary.path.clone(),
+            WholeFileRender {
+                collapsed_lines: lines.clone(),
+                collapsed_hunk_starts: hunk_starts.clone(),
+                lines,
+                hunk_starts,
+            },
+        );
 
         let mut terminal =
             Terminal::new(TestBackend::new(140, 40)).expect("test terminal should initialize");
@@ -4411,6 +4722,7 @@ mod tests {
                 } else {
                     None
                 },
+                collapsed_deletion: None,
             })
             .collect();
         let hunk_starts = (0..line_count).step_by(200).collect::<Vec<_>>();
@@ -4423,7 +4735,9 @@ mod tests {
                 summary.path.clone(),
                 WholeFileRender {
                     lines: whole_lines.clone(),
+                    collapsed_lines: whole_lines.clone(),
                     hunk_starts: hunk_starts.clone(),
+                    collapsed_hunk_starts: hunk_starts.clone(),
                 },
             );
         }
