@@ -5,6 +5,7 @@ mod export;
 mod git;
 mod model;
 mod updater;
+mod watcher;
 
 fn main() {
     if let Err(err) = cli::run() {
