@@ -12,6 +12,12 @@ use crate::updater;
     after_help = "Running `reb` without a subcommand is the same as `reb review`."
 )]
 struct Cli {
+    #[arg(
+        long,
+        global = true,
+        help = "Disable automatic refresh when repository files change"
+    )]
+    no_watch: bool,
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -49,6 +55,8 @@ pub struct ReviewArgs {
     pub path: Vec<String>,
     #[arg(long)]
     pub staged: bool,
+    #[arg(skip)]
+    pub no_watch: bool,
 }
 
 impl Default for ReviewArgs {
@@ -60,6 +68,7 @@ impl Default for ReviewArgs {
             theme: None,
             path: Vec::new(),
             staged: false,
+            no_watch: false,
         }
     }
 }
@@ -68,9 +77,15 @@ pub fn run() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Commands::Review(args)) => app::run(args),
+        Some(Commands::Review(mut args)) => {
+            args.no_watch = cli.no_watch;
+            app::run(args)
+        }
         Some(Commands::Update) => updater::run(),
-        None => app::run(ReviewArgs::default()),
+        None => app::run(ReviewArgs {
+            no_watch: cli.no_watch,
+            ..ReviewArgs::default()
+        }),
     }
 }
 
@@ -84,6 +99,7 @@ mod tests {
         let cli = Cli::try_parse_from(["reb"]).expect("cli should parse");
 
         assert!(cli.command.is_none());
+        assert!(!cli.no_watch);
     }
 
     #[test]
@@ -100,6 +116,7 @@ mod tests {
         assert_eq!(args.theme, None);
         assert!(args.path.is_empty());
         assert!(!args.staged);
+        assert!(!cli.no_watch);
     }
 
     #[test]
@@ -177,5 +194,22 @@ mod tests {
         let cli = Cli::try_parse_from(["reb", "update"]).expect("cli should parse");
 
         assert!(matches!(cli.command, Some(Commands::Update)));
+    }
+
+    #[test]
+    fn parses_no_watch_flag() {
+        let cli =
+            Cli::try_parse_from(["reb", "review", "--no-watch"]).expect("--no-watch should parse");
+
+        assert!(matches!(cli.command, Some(Commands::Review(_))));
+        assert!(cli.no_watch);
+    }
+
+    #[test]
+    fn parses_no_watch_without_review_subcommand() {
+        let cli = Cli::try_parse_from(["reb", "--no-watch"]).expect("--no-watch should parse");
+
+        assert!(cli.command.is_none());
+        assert!(cli.no_watch);
     }
 }

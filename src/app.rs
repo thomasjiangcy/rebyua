@@ -30,6 +30,7 @@ use crate::model::{
     Annotation, AnnotationLineRange, ChangeKind, DiffKind, FilePatch, FileSummary, Focus,
     LineReference, PatchLine, ReviewEdge, SelectionRange,
 };
+use crate::watcher::{RepoWatcher, WATCH_POLL_INTERVAL};
 
 const NOTIFICATION_TTL: Duration = Duration::from_secs(3);
 const COMMENT_BOX_HEIGHT: u16 = 5;
@@ -53,11 +54,35 @@ const DEFAULT_LIGHT_THEME_CANDIDATES: [&str; 3] =
 pub fn run(args: ReviewArgs) -> Result<()> {
     let resolved = ResolvedReview::discover(&args)?;
     let files = resolved.repo.load_files()?;
+    let watch_requested = !args.no_watch && resolved.sequence.is_none();
+    let (mut watcher, watcher_error) = if watch_requested {
+        match RepoWatcher::new(&resolved.repo.root) {
+            Ok(watcher) => (Some(watcher), None),
+            Err(err) => (None, Some(format!("Watching unavailable: {err}"))),
+        }
+    } else {
+        (None, None)
+    };
     let env_theme = std::env::var("REB_THEME").ok();
     let requested_theme = args.theme.as_deref().or(env_theme.as_deref());
-    let mut app = App::new(resolved.repo, files, resolved.sequence, requested_theme)?;
+    let watch_status = if watcher.is_some() {
+        WatchStatus::Active
+    } else {
+        WatchStatus::Off
+    };
+    let mut app = App::new(
+        resolved.repo,
+        files,
+        resolved.sequence,
+        requested_theme,
+        watch_status,
+    )?;
+    if let Some(error) = watcher_error {
+        app.set_notification(error, NotificationKind::Error);
+    }
     let mut terminal = TerminalSession::new()?;
     let mut needs_redraw = true;
+    let mut refresh_pending = false;
 
     while !app.should_quit {
         if needs_redraw {
@@ -68,7 +93,11 @@ pub fn run(args: ReviewArgs) -> Result<()> {
             needs_redraw = false;
         }
 
-        let poll_timeout = app.notification_poll_timeout();
+        let poll_timeout = if watcher.is_some() {
+            app.notification_poll_timeout().min(WATCH_POLL_INTERVAL)
+        } else {
+            app.notification_poll_timeout()
+        };
         if event::poll(poll_timeout).context("failed to poll terminal events")? {
             match event::read().context("failed to read terminal event")? {
                 Event::Key(key) if key.kind == event::KeyEventKind::Press => {
@@ -81,6 +110,42 @@ pub fn run(args: ReviewArgs) -> Result<()> {
         }
 
         if app.expire_notification() {
+            needs_redraw = true;
+        }
+
+        let mut watcher_failed = None;
+        if let Some(active_watcher) = watcher.as_mut() {
+            let update = active_watcher.poll(Instant::now());
+            if update.refresh_due {
+                refresh_pending = true;
+                app.watch_status = WatchStatus::Pending;
+                needs_redraw = true;
+            }
+            watcher_failed = update.error;
+        }
+        if let Some(error) = watcher_failed {
+            watcher = None;
+            refresh_pending = false;
+            app.watch_status = WatchStatus::Off;
+            app.set_notification(error, NotificationKind::Error);
+            needs_redraw = true;
+        }
+
+        if refresh_pending && !app.refresh_is_blocked() {
+            match app.refresh_from_repo() {
+                Ok(()) => {
+                    refresh_pending = false;
+                    app.watch_status = WatchStatus::Active;
+                }
+                Err(err) => {
+                    refresh_pending = false;
+                    app.watch_status = WatchStatus::Active;
+                    app.set_notification(
+                        format!("Automatic refresh failed: {err}"),
+                        NotificationKind::Error,
+                    );
+                }
+            }
             needs_redraw = true;
         }
     }
@@ -298,6 +363,21 @@ enum SearchDirection {
     Backward,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchStatus {
+    Active,
+    Off,
+    Pending,
+}
+
+#[derive(Debug, Clone)]
+struct RefreshAnchor {
+    old_lineno: Option<usize>,
+    new_lineno: Option<usize>,
+    text: String,
+    line_idx: usize,
+}
+
 struct App {
     repo: GitRepo,
     review_sequence: Option<ReviewSequence>,
@@ -330,6 +410,7 @@ struct App {
     pending_quit_confirmation: bool,
     pending_g_prefix: bool,
     should_quit: bool,
+    watch_status: WatchStatus,
     last_files_inner_height: u16,
     last_diff_inner_height: u16,
     syntax_set: SyntaxSet,
@@ -342,6 +423,7 @@ impl App {
         files: Vec<FileSummary>,
         review_sequence: Option<ReviewSequence>,
         requested_theme: Option<&str>,
+        watch_status: WatchStatus,
     ) -> Result<Self> {
         let syntax_set = SyntaxSet::load_defaults_nonewlines();
         let theme_set = ThemeSet::load_defaults();
@@ -379,6 +461,7 @@ impl App {
             pending_quit_confirmation: false,
             pending_g_prefix: false,
             should_quit: false,
+            watch_status,
             last_files_inner_height: 0,
             last_diff_inner_height: 0,
             syntax_set,
@@ -452,6 +535,19 @@ impl App {
             KeyCode::Char('/') => self.open_slash_prompt(),
             KeyCode::Char(':') if self.focus == Focus::Diff => self.open_line_jump_prompt(),
             KeyCode::Char('E') => self.export_to_clipboard(),
+            KeyCode::Char('R') => {
+                if self.refresh_is_blocked() {
+                    self.set_notification(
+                        "Finish or cancel the current interaction before refreshing".to_string(),
+                        NotificationKind::Error,
+                    );
+                } else if let Err(err) = self.refresh_from_repo() {
+                    self.set_notification(
+                        format!("Manual refresh failed: {err}"),
+                        NotificationKind::Error,
+                    );
+                }
+            }
             _ => {}
         }
 
@@ -2046,9 +2142,9 @@ impl App {
             );
         } else {
             let help = if self.review_sequence.is_some() {
-                "h/l focus  j/k move  </> edge  [/] file  / search  n/p next-prev  : line  t view  r removals  v select  c line  C file  F file-comments  E copy"
+                "h/l focus  j/k move  </> edge  [/] file  / search  n/p next-prev  : line  t view  r removals  R refresh  v select  c line  C file  F file-comments  E copy"
             } else {
-                "h/l focus  j/k move  [/] file  / search  n/p next-prev  : line  t view  r removals  v select  c line  C file  F file-comments  E copy"
+                "h/l focus  j/k move  [/] file  / search  n/p next-prev  : line  t view  r removals  R refresh  v select  c line  C file  F file-comments  E copy"
             };
             frame.render_widget(Paragraph::new(help), chunks[0]);
         }
@@ -2059,7 +2155,161 @@ impl App {
     }
 
     fn footer_metadata(&self) -> String {
-        format!("reb v{}", env!("CARGO_PKG_VERSION"))
+        let watch_label = match self.watch_status {
+            WatchStatus::Active => "watching",
+            WatchStatus::Off => "watch off",
+            WatchStatus::Pending => "changes pending",
+        };
+        format!("reb v{} · {watch_label}", env!("CARGO_PKG_VERSION"))
+    }
+
+    fn refresh_is_blocked(&self) -> bool {
+        self.comment_draft.is_some()
+            || self.comment_selection.is_some()
+            || self.prompt_input.is_some()
+            || self.selection.is_some()
+    }
+
+    fn refresh_from_repo(&mut self) -> Result<()> {
+        let files = self.repo.load_files()?;
+        let preferred_path = self
+            .selected_file_summary()
+            .map(|summary| summary.path.clone());
+        let previous_view_idx = self.selected_file_view_idx;
+        let anchor = self.current_refresh_anchor();
+
+        self.files = files;
+        self.patch_cache.clear();
+        self.patch_cache_order.clear();
+        self.patch_highlight_cache.clear();
+        self.whole_file_cache.clear();
+        self.whole_file_cache_order.clear();
+        self.whole_file_highlight_cache.clear();
+        self.expanded_comment_line = None;
+        self.filtered_file_indices = self
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(_, file)| {
+                self.filter_query.is_empty() || file.path.contains(&self.filter_query)
+            })
+            .map(|(idx, _)| idx)
+            .collect();
+
+        if self.filtered_file_indices.is_empty() {
+            self.selected_file_view_idx = 0;
+            self.file_list_scroll = 0;
+            self.diff_cursor = 0;
+            self.diff_scroll = 0;
+            self.focus = Focus::Files;
+        } else {
+            self.selected_file_view_idx = preferred_path
+                .as_ref()
+                .and_then(|path| {
+                    self.filtered_file_indices
+                        .iter()
+                        .position(|file_idx| self.files[*file_idx].path == *path)
+                })
+                .unwrap_or_else(|| previous_view_idx.min(self.filtered_file_indices.len() - 1));
+            self.ensure_file_selection_visible();
+            self.load_selected_patch();
+            if self.view_mode == DiffViewMode::File && !self.load_whole_file_for_selected() {
+                self.view_mode = DiffViewMode::Patch;
+            }
+            self.restore_refresh_anchor(anchor.as_ref());
+            self.ensure_cursor_visible();
+        }
+
+        self.set_notification("Changes refreshed".to_string(), NotificationKind::Success);
+        Ok(())
+    }
+
+    fn current_refresh_anchor(&self) -> Option<RefreshAnchor> {
+        match self.view_mode {
+            DiffViewMode::Patch => self.current_patch().and_then(|patch| {
+                patch
+                    .flat_lines
+                    .get(self.diff_cursor)
+                    .map(|line| RefreshAnchor {
+                        old_lineno: line.old_lineno,
+                        new_lineno: line.new_lineno,
+                        text: line.text.clone(),
+                        line_idx: self.diff_cursor,
+                    })
+            }),
+            DiffViewMode::File => self.current_whole_file().and_then(|file| {
+                file.visible_lines(self.show_removed_lines)
+                    .get(self.diff_cursor)
+                    .map(|line| RefreshAnchor {
+                        old_lineno: line.old_lineno.or_else(|| {
+                            line.collapsed_deletion.map(|collapsed| collapsed.old_start)
+                        }),
+                        new_lineno: line.new_lineno,
+                        text: line.text.clone(),
+                        line_idx: self.diff_cursor,
+                    })
+            }),
+        }
+    }
+
+    fn restore_refresh_anchor(&mut self, anchor: Option<&RefreshAnchor>) {
+        let Some(anchor) = anchor else {
+            self.diff_cursor = 0;
+            self.diff_scroll = 0;
+            return;
+        };
+
+        let exact = match self.view_mode {
+            DiffViewMode::Patch => self.find_patch_line(anchor.old_lineno, anchor.new_lineno),
+            DiffViewMode::File => self.find_whole_file_line(anchor.old_lineno, anchor.new_lineno),
+        };
+        let unchanged_exact =
+            exact.filter(|idx| self.line_text_at(*idx) == Some(anchor.text.as_str()));
+        self.diff_cursor = unchanged_exact
+            .or_else(|| self.find_nearby_line_text(&anchor.text, anchor.line_idx))
+            .or(exact)
+            .unwrap_or_else(|| {
+                anchor
+                    .line_idx
+                    .min(self.current_line_count().saturating_sub(1))
+            });
+    }
+
+    fn find_nearby_line_text(&self, text: &str, previous_idx: usize) -> Option<usize> {
+        match self.view_mode {
+            DiffViewMode::Patch => self.current_patch().and_then(|patch| {
+                patch
+                    .flat_lines
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, line)| line.text == text)
+                    .min_by_key(|(idx, _)| idx.abs_diff(previous_idx))
+                    .map(|(idx, _)| idx)
+            }),
+            DiffViewMode::File => self.current_whole_file().and_then(|file| {
+                file.visible_lines(self.show_removed_lines)
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, line)| line.text == text)
+                    .min_by_key(|(idx, _)| idx.abs_diff(previous_idx))
+                    .map(|(idx, _)| idx)
+            }),
+        }
+    }
+
+    fn line_text_at(&self, line_idx: usize) -> Option<&str> {
+        match self.view_mode {
+            DiffViewMode::Patch => self
+                .current_patch()?
+                .flat_lines
+                .get(line_idx)
+                .map(|line| line.text.as_str()),
+            DiffViewMode::File => self
+                .current_whole_file()?
+                .visible_lines(self.show_removed_lines)
+                .get(line_idx)
+                .map(|line| line.text.as_str()),
+        }
     }
 
     fn refresh_filtered_files(&mut self) {
@@ -3554,6 +3804,7 @@ mod tests {
     use ratatui::backend::TestBackend;
     use std::fs;
     use std::path::PathBuf;
+    use std::process::Command;
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     struct TempDirGuard {
@@ -3675,6 +3926,7 @@ mod tests {
             pending_quit_confirmation: false,
             pending_g_prefix: false,
             should_quit: false,
+            watch_status: WatchStatus::Off,
             last_files_inner_height: 0,
             last_diff_inner_height: 20,
             syntax_set: SyntaxSet::load_defaults_nonewlines(),
@@ -3701,6 +3953,20 @@ mod tests {
 
     fn key_ctrl(ch: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL)
+    }
+
+    fn run_test_git(root: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .current_dir(root)
+            .args(args)
+            .output()
+            .expect("git should run");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     fn key_shift(code: KeyCode) -> KeyEvent {
@@ -4424,7 +4690,55 @@ mod tests {
         let metadata = app.footer_metadata();
 
         assert!(metadata.contains(env!("CARGO_PKG_VERSION")));
-        assert_eq!(metadata, format!("reb v{}", env!("CARGO_PKG_VERSION")));
+        assert_eq!(
+            metadata,
+            format!("reb v{} · watch off", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
+    fn refresh_preserves_selected_file_and_nearby_line() {
+        let temp = TempDirGuard::new();
+        run_test_git(&temp.path, &["init", "--quiet"]);
+        run_test_git(&temp.path, &["config", "user.name", "Rebyua Tests"]);
+        run_test_git(
+            &temp.path,
+            &["config", "user.email", "rebyua-tests@example.com"],
+        );
+
+        let file_path = temp.path.join("demo.txt");
+        fs::write(&file_path, "one\ntwo\nthree\n").expect("base file should be written");
+        run_test_git(&temp.path, &["add", "demo.txt"]);
+        run_test_git(&temp.path, &["commit", "--quiet", "-m", "base"]);
+        fs::write(&file_path, "one\ntwo changed\nthree\n").expect("changed file should be written");
+
+        let repo = GitRepo::for_worktree(temp.path.clone(), "HEAD".to_string(), false, Vec::new());
+        let files = repo.load_files().expect("changed files should load");
+        let mut app =
+            App::new(repo, files, None, None, WatchStatus::Active).expect("app should initialize");
+        let selected_line = app
+            .current_whole_file()
+            .expect("whole-file view should load")
+            .visible_lines(false)
+            .iter()
+            .position(|line| line.text == "two changed")
+            .expect("changed line should exist");
+        app.diff_cursor = selected_line;
+
+        fs::write(&file_path, "inserted\none\ntwo changed\nthree\n")
+            .expect("second change should be written");
+        app.refresh_from_repo().expect("refresh should succeed");
+
+        assert_eq!(
+            app.selected_file_summary().map(|file| file.path.as_str()),
+            Some("demo.txt")
+        );
+        let current_line = &app
+            .current_whole_file()
+            .expect("refreshed whole-file view should load")
+            .visible_lines(false)[app.diff_cursor];
+        assert_eq!(current_line.text, "two changed");
+        assert_eq!(current_line.new_lineno, Some(3));
     }
 
     #[test]

@@ -64,6 +64,8 @@ You can also review against a different base, restrict paths, or inspect staged 
 reb review
 reb review --base origin/main
 reb review --staged
+reb review --no-watch
+reb --no-watch
 reb review --path src/app.rs --path src/cli.rs
 reb review --stack feat/c --base origin/main
 reb review --commits --base origin/main
@@ -77,6 +79,9 @@ reb review --commits origin/main..feat/change
 3. Move through files and diffs, add comments, then press `E` to copy the review as Markdown.
 4. Paste that review back into your coding agent.
 5. Repeat until the patch is where you want it.
+
+`reb` watches the working tree and refreshes the review automatically when files change. Use
+`--no-watch` to disable automatic refresh, or press `R` to refresh manually in either mode.
 
 To update an existing install from GitHub Releases:
 
@@ -94,6 +99,7 @@ This checks the latest GitHub release for the current platform and replaces the 
 - `gg` / `G`: jump to top or bottom
 - `J` / `K`: jump between hunks
 - `r`: reveal or collapse removed lines in the current-file view
+- `R`: refresh the review immediately
 - `t`: toggle between current-file and traditional patch views
 - `v`: start or lock a line-range selection
 - `c`: comment on the current line or selected range
