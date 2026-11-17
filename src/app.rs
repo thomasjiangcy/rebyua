@@ -1,7 +1,9 @@
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::Path;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -31,6 +33,7 @@ use crate::model::{
 };
 use crate::theme::{Palette, ThemeMode, detect_theme_mode};
 use crate::watcher::{RepoWatcher, WATCH_POLL_INTERVAL};
+use crate::wrap;
 
 const NOTIFICATION_TTL: Duration = Duration::from_secs(3);
 const COMMENT_BOX_HEIGHT: u16 = 5;
@@ -415,6 +418,9 @@ struct App {
     watch_status: WatchStatus,
     last_files_inner_height: u16,
     last_diff_inner_height: u16,
+    last_diff_inner_width: u16,
+    wrap_lines: bool,
+    wrap_rows_cache: RefCell<Option<WrapRowsCache>>,
     syntax_set: SyntaxSet,
     syntax_theme: Theme,
     palette: &'static Palette,
@@ -469,6 +475,9 @@ impl App {
             watch_status,
             last_files_inner_height: 0,
             last_diff_inner_height: 0,
+            last_diff_inner_width: 0,
+            wrap_lines: true,
+            wrap_rows_cache: RefCell::new(None),
             syntax_set,
             syntax_theme,
             palette: Palette::for_mode(theme_mode),
@@ -535,6 +544,7 @@ impl App {
             KeyCode::Char('C') => self.open_file_comment_draft(),
             KeyCode::Char('F') => self.inspect_file_comments(),
             KeyCode::Char('r') => self.toggle_removed_lines(),
+            KeyCode::Char('w') => self.toggle_wrap_lines(),
             KeyCode::Char('t') => self.toggle_view_mode(),
             KeyCode::Enter if self.focus == Focus::Diff => self.inspect_current_comments(),
             KeyCode::Esc => self.clear_transient_state(),
@@ -1328,6 +1338,7 @@ impl App {
         self.whole_file_cache.clear();
         self.whole_file_cache_order.clear();
         self.whole_file_highlight_cache.clear();
+        self.invalidate_wrap_rows();
         self.diff_cursor = 0;
         self.diff_scroll = 0;
         self.selection = None;
@@ -1442,6 +1453,128 @@ impl App {
 
         self.diff_scroll = 0;
         self.ensure_cursor_visible();
+    }
+
+    fn toggle_wrap_lines(&mut self) {
+        self.wrap_lines = !self.wrap_lines;
+        self.invalidate_wrap_rows();
+        self.diff_scroll = 0;
+        self.ensure_cursor_visible();
+    }
+
+    fn invalidate_wrap_rows(&self) {
+        self.wrap_rows_cache.borrow_mut().take();
+    }
+
+    /// Rows each visible diff line occupies at the current panel width.
+    fn layout_rows(&self, line_count: usize) -> LayoutRows {
+        let width = self.last_diff_inner_width;
+        if !self.wrap_lines || width == 0 || line_count == 0 {
+            return LayoutRows::Uniform;
+        }
+        let Some(path) = self
+            .selected_file_summary()
+            .map(|summary| summary.path.clone())
+        else {
+            return LayoutRows::Uniform;
+        };
+        let key = WrapRowsKey {
+            path,
+            view_mode: self.view_mode,
+            show_removed_lines: self.show_removed_lines,
+            width,
+            line_count,
+        };
+        if let Some(cache) = self.wrap_rows_cache.borrow().as_ref()
+            && cache.key == key
+        {
+            return LayoutRows::Wrapped(Rc::clone(&cache.row_starts));
+        }
+
+        let width = width as usize;
+        let mut row_starts = Vec::with_capacity(line_count + 1);
+        let mut total = 0usize;
+        let mut push = |old: Option<usize>, new: Option<usize>, text: &str| {
+            row_starts.push(total);
+            let text_width = width.saturating_sub(diff_prefix_width(old, new));
+            total += if text_width == 0 {
+                1
+            } else {
+                wrap::row_count(text, text_width)
+            };
+        };
+        match self.view_mode {
+            DiffViewMode::Patch => {
+                let Some(patch) = self.current_patch() else {
+                    return LayoutRows::Uniform;
+                };
+                for line in &patch.flat_lines {
+                    push(line.old_lineno, line.new_lineno, &line.text);
+                }
+            }
+            DiffViewMode::File => {
+                let Some(file) = self.current_whole_file() else {
+                    return LayoutRows::Uniform;
+                };
+                for line in file.visible_lines(self.show_removed_lines) {
+                    let old = if line.collapsed_deletion.is_some() {
+                        None
+                    } else {
+                        line.old_lineno
+                    };
+                    push(old, line.new_lineno, &line.text);
+                }
+            }
+        }
+        row_starts.push(total);
+        if row_starts.len() != line_count + 1 {
+            return LayoutRows::Uniform;
+        }
+
+        let row_starts: Rc<[usize]> = row_starts.into();
+        *self.wrap_rows_cache.borrow_mut() = Some(WrapRowsCache {
+            key,
+            row_starts: Rc::clone(&row_starts),
+        });
+        LayoutRows::Wrapped(row_starts)
+    }
+
+    fn render_wrapped_line(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        skip_rows: usize,
+        prefix: Vec<Span<'static>>,
+        segments: Vec<(String, Style)>,
+        line_style: Style,
+    ) {
+        let prefix_width: usize = prefix.iter().map(Span::width).sum();
+        let text: String = segments.iter().map(|(text, _)| text.as_str()).collect();
+        let text_width = if self.wrap_lines {
+            (area.width as usize).saturating_sub(prefix_width)
+        } else {
+            0
+        };
+        let rows = wrap::break_rows(&text, text_width);
+        let mut lines = Vec::with_capacity(rows.len());
+        let mut prefix = Some(prefix);
+        for row_spans in wrap::split_segments(&segments, &rows) {
+            let mut spans = prefix.take().unwrap_or_else(|| {
+                vec![
+                    Span::raw(" ".repeat(prefix_width.saturating_sub(2))),
+                    Span::styled("↪", Style::default().fg(self.palette.muted)),
+                    Span::raw(" "),
+                ]
+            });
+            spans.extend(row_spans);
+            lines.push(Line::from(spans));
+        }
+        let lines: Vec<Line> = lines
+            .into_iter()
+            .skip(skip_rows)
+            .take(area.height as usize)
+            .collect();
+        frame.render_widget(Paragraph::new(lines).style(line_style), area);
     }
 
     fn toggle_removed_lines(&mut self) {
@@ -1670,7 +1803,8 @@ impl App {
                 DiffViewMode::File if self.show_removed_lines => "file · removals shown",
                 DiffViewMode::File => "file · removals hidden",
             };
-            format!(" Diff {} [{}] ", summary.path, mode)
+            let wrap = if self.wrap_lines { "" } else { " · no wrap" };
+            format!(" Diff {} [{}{}] ", summary.path, mode, wrap)
         } else {
             " Diff ".to_string()
         };
@@ -1682,6 +1816,7 @@ impl App {
         let inner = block.inner(area);
         frame.render_widget(block, area);
         self.last_diff_inner_height = inner.height;
+        self.last_diff_inner_width = inner.width;
 
         match self.view_mode {
             DiffViewMode::Patch => self.render_patch_view(frame, inner),
@@ -1757,10 +1892,14 @@ impl App {
                 break;
             }
 
-            if let Some(row_area) =
-                next_visible_item_area(inner, &mut y, &mut visual_offset, self.diff_scroll, 1)
-            {
-                self.render_diff_line(frame, row_area, line_idx);
+            if let Some((row_area, skip_rows)) = next_visible_line_area(
+                inner,
+                &mut y,
+                &mut visual_offset,
+                self.diff_scroll,
+                layout.line_height(line_idx),
+            ) {
+                self.render_diff_line(frame, row_area, skip_rows, line_idx);
             }
             if layout.editor_anchor == Some(line_idx)
                 && let Some(row_area) = next_visible_item_area(
@@ -1832,10 +1971,14 @@ impl App {
                 break;
             }
 
-            if let Some(row_area) =
-                next_visible_item_area(inner, &mut y, &mut visual_offset, self.diff_scroll, 1)
-            {
-                self.render_whole_file_line(frame, row_area, line_idx);
+            if let Some((row_area, skip_rows)) = next_visible_line_area(
+                inner,
+                &mut y,
+                &mut visual_offset,
+                self.diff_scroll,
+                layout.line_height(line_idx),
+            ) {
+                self.render_whole_file_line(frame, row_area, skip_rows, line_idx);
             }
             if layout.editor_anchor == Some(line_idx)
                 && let Some(row_area) = next_visible_item_area(
@@ -1862,7 +2005,13 @@ impl App {
         }
     }
 
-    fn render_diff_line(&mut self, frame: &mut Frame, area: Rect, line_idx: usize) {
+    fn render_diff_line(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        skip_rows: usize,
+        line_idx: usize,
+    ) {
         let Some(line) = self
             .current_patch()
             .and_then(|patch| patch.flat_lines.get(line_idx))
@@ -1902,7 +2051,7 @@ impl App {
             .map(|value| format!("{value:>4}"))
             .unwrap_or_else(|| "    ".to_string());
 
-        let mut spans = vec![
+        let spans = vec![
             Span::styled(
                 format!("{gutter} "),
                 Style::default().fg(self.palette.marker),
@@ -1919,18 +2068,17 @@ impl App {
         ];
 
         let highlighted = self.patch_highlights(line_idx);
-        if !highlighted.is_empty() {
-            for segment in highlighted {
-                spans.push(Span::styled(segment.text, segment.style));
-            }
-        } else {
-            spans.push(Span::raw(line.text.clone()));
-        }
-
-        frame.render_widget(Paragraph::new(Line::from(spans)).style(line_style), area);
+        let segments = content_segments(highlighted, &line.text);
+        self.render_wrapped_line(frame, area, skip_rows, spans, segments, line_style);
     }
 
-    fn render_whole_file_line(&mut self, frame: &mut Frame, area: Rect, line_idx: usize) {
+    fn render_whole_file_line(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        skip_rows: usize,
+        line_idx: usize,
+    ) {
         let Some(line) = self
             .current_whole_file()
             .and_then(|file| file.visible_lines(self.show_removed_lines).get(line_idx))
@@ -1977,7 +2125,7 @@ impl App {
             .map(|value| format!("{value:>4}"))
             .unwrap_or_else(|| "    ".to_string());
 
-        let mut spans = vec![
+        let spans = vec![
             Span::styled(
                 format!("{gutter} "),
                 Style::default().fg(self.palette.marker),
@@ -1998,15 +2146,8 @@ impl App {
         } else {
             self.whole_file_highlights(line_idx)
         };
-        if highlighted.is_empty() {
-            spans.push(Span::raw(line.text.clone()));
-        } else {
-            for segment in highlighted {
-                spans.push(Span::styled(segment.text, segment.style));
-            }
-        }
-
-        frame.render_widget(Paragraph::new(Line::from(spans)).style(line_style), area);
+        let segments = content_segments(highlighted, &line.text);
+        self.render_wrapped_line(frame, area, skip_rows, spans, segments, line_style);
     }
 
     fn render_comment_editor(&mut self, frame: &mut Frame, area: Rect) {
@@ -2162,9 +2303,9 @@ impl App {
             );
         } else {
             let help = if self.review_sequence.is_some() {
-                "h/l focus  j/k move  </> edge  [/] file  / search  n/p next-prev  : line  t view  r removals  R refresh  v select  c line  C file  F file-comments  E copy"
+                "h/l focus  j/k move  </> edge  [/] file  / search  n/p next-prev  : line  t view  r removals  w wrap  R refresh  v select  c line  C file  F file-comments  E copy"
             } else {
-                "h/l focus  j/k move  [/] file  / search  n/p next-prev  : line  t view  r removals  R refresh  v select  c line  C file  F file-comments  E copy"
+                "h/l focus  j/k move  [/] file  / search  n/p next-prev  : line  t view  r removals  w wrap  R refresh  v select  c line  C file  F file-comments  E copy"
             };
             frame.render_widget(Paragraph::new(help), chunks[0]);
         }
@@ -2205,6 +2346,7 @@ impl App {
         self.whole_file_cache.clear();
         self.whole_file_cache_order.clear();
         self.whole_file_highlight_cache.clear();
+        self.invalidate_wrap_rows();
         self.expanded_comment_line = None;
         self.filtered_file_indices = self
             .files
@@ -2548,7 +2690,7 @@ impl App {
         }
     }
 
-    fn patch_layout(&self) -> PatchLayout {
+    fn patch_layout(&self) -> DiffLayout {
         let file_comments_count = self.file_comments_for_selected_file().len();
         let file_comments_height = if file_comments_count > 0 {
             file_comments_height(file_comments_count) as usize
@@ -2572,11 +2714,15 @@ impl App {
                 .or(Some(line_idx))
         });
 
-        PatchLayout {
+        DiffLayout {
             file_comments_height,
             file_editor,
             editor_anchor,
             expanded_anchor,
+            rows: self.layout_rows(
+                self.current_patch()
+                    .map_or(0, |patch| patch.flat_lines.len()),
+            ),
         }
     }
 
@@ -2586,7 +2732,7 @@ impl App {
             return;
         }
 
-        let (line_visual_row, editor_end) = match self.view_mode {
+        let (line_visual_row, line_height, editor_end) = match self.view_mode {
             DiffViewMode::Patch => {
                 let Some(line_count) = self.current_patch().map(|patch| patch.flat_lines.len())
                 else {
@@ -2597,7 +2743,9 @@ impl App {
                 }
 
                 let layout = self.patch_layout();
-                let line_visual_row = layout.line_row_start(self.diff_cursor.min(line_count - 1));
+                let cursor_line = self.diff_cursor.min(line_count - 1);
+                let line_visual_row = layout.line_row_start(cursor_line);
+                let line_height = layout.line_height(cursor_line);
                 let editor_end = if let Some(draft) = &self.comment_draft {
                     if draft.is_file_comment() {
                         Some(layout.file_comments_height + COMMENT_BOX_HEIGHT as usize)
@@ -2612,7 +2760,7 @@ impl App {
                     })
                 };
 
-                (line_visual_row, editor_end)
+                (line_visual_row, line_height, editor_end)
             }
             DiffViewMode::File => {
                 let Some(file_len) = self
@@ -2625,7 +2773,9 @@ impl App {
                     return;
                 }
                 let layout = self.whole_file_layout();
-                let line_visual_row = layout.line_row_start(self.diff_cursor.min(file_len - 1));
+                let cursor_line = self.diff_cursor.min(file_len - 1);
+                let line_visual_row = layout.line_row_start(cursor_line);
+                let line_height = layout.line_height(cursor_line);
                 let editor_end = if let Some(draft) = &self.comment_draft {
                     if draft.is_file_comment() {
                         Some(layout.file_comments_height + COMMENT_BOX_HEIGHT as usize)
@@ -2640,14 +2790,19 @@ impl App {
                     })
                 };
 
-                (line_visual_row, editor_end)
+                (line_visual_row, line_height, editor_end)
             }
         };
 
+        // Bring the whole (possibly wrapped) cursor line into view, favouring
+        // its first row when it is taller than the viewport.
+        let line_last_row = line_visual_row + line_height.saturating_sub(1);
         if line_visual_row < self.diff_scroll {
             self.diff_scroll = line_visual_row;
-        } else if line_visual_row >= self.diff_scroll + height {
-            self.diff_scroll = line_visual_row.saturating_sub(height.saturating_sub(1));
+        } else if line_last_row >= self.diff_scroll + height {
+            self.diff_scroll = line_last_row
+                .saturating_sub(height.saturating_sub(1))
+                .min(line_visual_row);
         }
 
         if let Some(editor_end) = editor_end
@@ -2707,7 +2862,7 @@ impl App {
         }
     }
 
-    fn whole_file_layout(&self) -> WholeFileLayout {
+    fn whole_file_layout(&self) -> DiffLayout {
         let file_comments_count = self.file_comments_for_selected_file().len();
         let file_editor = self
             .comment_draft
@@ -2718,7 +2873,7 @@ impl App {
             .as_ref()
             .and_then(CommentDraft::editor_anchor);
 
-        WholeFileLayout {
+        DiffLayout {
             file_comments_height: if file_comments_count > 0 {
                 file_comments_height(file_comments_count) as usize
             } else {
@@ -2727,6 +2882,10 @@ impl App {
             file_editor,
             editor_anchor,
             expanded_anchor: self.expanded_comment_line,
+            rows: self.layout_rows(
+                self.current_whole_file()
+                    .map_or(0, |file| file.visible_lines(self.show_removed_lines).len()),
+            ),
         }
     }
 
@@ -3150,6 +3309,7 @@ impl App {
     }
 
     fn insert_patch_cache(&mut self, path: String, patch: HighlightedPatch) {
+        self.invalidate_wrap_rows();
         self.patch_cache.insert(path.clone(), patch);
         self.patch_highlight_cache.insert(
             path.clone(),
@@ -3173,6 +3333,7 @@ impl App {
     }
 
     fn insert_whole_file_cache(&mut self, path: String, whole: WholeFileRender) {
+        self.invalidate_wrap_rows();
         self.whole_file_cache.insert(path.clone(), whole);
         self.whole_file_highlight_cache.insert(
             path.clone(),
@@ -3196,24 +3357,61 @@ impl App {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct WholeFileLayout {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WrapRowsKey {
+    path: String,
+    view_mode: DiffViewMode,
+    show_removed_lines: bool,
+    width: u16,
+    line_count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct WrapRowsCache {
+    key: WrapRowsKey,
+    row_starts: Rc<[usize]>,
+}
+
+/// How many terminal rows each diff line takes up.
+#[derive(Debug, Clone)]
+enum LayoutRows {
+    /// One row per line (wrapping off, or panel width not known yet).
+    Uniform,
+    /// Cumulative row offsets: `row_starts[i]` is the first row of line `i`,
+    /// with one trailing entry holding the total.
+    Wrapped(Rc<[usize]>),
+}
+
+impl LayoutRows {
+    fn start(&self, line_idx: usize) -> usize {
+        match self {
+            Self::Uniform => line_idx,
+            Self::Wrapped(row_starts) => row_starts[line_idx.min(row_starts.len() - 1)],
+        }
+    }
+
+    fn height(&self, line_idx: usize) -> usize {
+        match self {
+            Self::Uniform => 1,
+            Self::Wrapped(row_starts) if line_idx + 1 < row_starts.len() => {
+                row_starts[line_idx + 1] - row_starts[line_idx]
+            }
+            Self::Wrapped(_) => 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DiffLayout {
     file_comments_height: usize,
     file_editor: bool,
     editor_anchor: Option<usize>,
     expanded_anchor: Option<usize>,
+    rows: LayoutRows,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct PatchLayout {
-    file_comments_height: usize,
-    file_editor: bool,
-    editor_anchor: Option<usize>,
-    expanded_anchor: Option<usize>,
-}
-
-impl PatchLayout {
-    fn prefix_rows(self) -> usize {
+impl DiffLayout {
+    fn prefix_rows(&self) -> usize {
         self.file_comments_height
             + if self.file_editor {
                 COMMENT_BOX_HEIGHT as usize
@@ -3222,15 +3420,19 @@ impl PatchLayout {
             }
     }
 
-    fn line_row_start(self, line_idx: usize) -> usize {
-        self.prefix_rows() + line_idx + self.extra_rows_before_line(line_idx)
+    fn line_row_start(&self, line_idx: usize) -> usize {
+        self.prefix_rows() + self.rows.start(line_idx) + self.extra_rows_before_line(line_idx)
     }
 
-    fn editor_start(self, line_idx: usize) -> usize {
-        self.line_row_start(line_idx) + 1
+    fn line_height(&self, line_idx: usize) -> usize {
+        self.rows.height(line_idx)
     }
 
-    fn expanded_start(self, line_idx: usize) -> usize {
+    fn editor_start(&self, line_idx: usize) -> usize {
+        self.line_row_start(line_idx) + self.line_height(line_idx)
+    }
+
+    fn expanded_start(&self, line_idx: usize) -> usize {
         self.editor_start(line_idx)
             + if self.editor_anchor == Some(line_idx) {
                 COMMENT_BOX_HEIGHT as usize
@@ -3239,36 +3441,25 @@ impl PatchLayout {
             }
     }
 
-    fn first_visible_line(self, diff_scroll: usize, line_count: usize) -> usize {
+    /// The last line whose first row is at or above `diff_scroll`.
+    fn first_visible_line(&self, diff_scroll: usize, line_count: usize) -> usize {
         if line_count == 0 || diff_scroll <= self.prefix_rows() {
             return 0;
         }
 
-        let mut line_idx = diff_scroll
-            .saturating_sub(self.prefix_rows())
-            .min(line_count - 1);
-
-        for _ in 0..3 {
-            let adjusted = diff_scroll
-                .saturating_sub(self.prefix_rows() + self.extra_rows_before_line(line_idx))
-                .min(line_count - 1);
-            if adjusted == line_idx {
-                break;
+        let (mut lo, mut hi) = (0, line_count - 1);
+        while lo < hi {
+            let mid = (lo + hi).div_ceil(2);
+            if self.line_row_start(mid) <= diff_scroll {
+                lo = mid;
+            } else {
+                hi = mid - 1;
             }
-            line_idx = adjusted;
         }
-
-        while line_idx > 0 && self.line_row_start(line_idx) > diff_scroll {
-            line_idx -= 1;
-        }
-        while line_idx + 1 < line_count && self.line_row_start(line_idx + 1) <= diff_scroll {
-            line_idx += 1;
-        }
-
-        line_idx
+        lo
     }
 
-    fn extra_rows_before_line(self, line_idx: usize) -> usize {
+    fn extra_rows_before_line(&self, line_idx: usize) -> usize {
         let editor_rows = if self.editor_anchor.is_some_and(|anchor| anchor < line_idx) {
             COMMENT_BOX_HEIGHT as usize
         } else {
@@ -3283,75 +3474,21 @@ impl PatchLayout {
     }
 }
 
-impl WholeFileLayout {
-    fn prefix_rows(self) -> usize {
-        self.file_comments_height
-            + if self.file_editor {
-                COMMENT_BOX_HEIGHT as usize
-            } else {
-                0
-            }
+/// Columns taken by the gutter, line numbers and sign before a line's text.
+fn diff_prefix_width(old_lineno: Option<usize>, new_lineno: Option<usize>) -> usize {
+    let lineno_width =
+        |lineno: Option<usize>| lineno.map_or(4, |value| value.to_string().len().max(4));
+    2 + lineno_width(old_lineno) + 1 + lineno_width(new_lineno) + 1 + 1 + 1
+}
+
+fn content_segments(highlighted: Vec<StyledSegment>, raw_text: &str) -> Vec<(String, Style)> {
+    if highlighted.is_empty() {
+        return vec![(wrap::expand_tabs(raw_text).into_owned(), Style::default())];
     }
-
-    fn line_row_start(self, line_idx: usize) -> usize {
-        self.prefix_rows() + line_idx + self.extra_rows_before_line(line_idx)
-    }
-
-    fn editor_start(self, line_idx: usize) -> usize {
-        self.line_row_start(line_idx) + 1
-    }
-
-    fn expanded_start(self, line_idx: usize) -> usize {
-        self.editor_start(line_idx)
-            + if self.editor_anchor == Some(line_idx) {
-                COMMENT_BOX_HEIGHT as usize
-            } else {
-                0
-            }
-    }
-
-    fn first_visible_line(self, diff_scroll: usize, file_line_count: usize) -> usize {
-        if file_line_count == 0 || diff_scroll <= self.prefix_rows() {
-            return 0;
-        }
-
-        let mut line_idx = diff_scroll
-            .saturating_sub(self.prefix_rows())
-            .min(file_line_count - 1);
-
-        for _ in 0..3 {
-            let adjusted = diff_scroll
-                .saturating_sub(self.prefix_rows() + self.extra_rows_before_line(line_idx))
-                .min(file_line_count - 1);
-            if adjusted == line_idx {
-                break;
-            }
-            line_idx = adjusted;
-        }
-
-        while line_idx > 0 && self.line_row_start(line_idx) > diff_scroll {
-            line_idx -= 1;
-        }
-        while line_idx + 1 < file_line_count && self.line_row_start(line_idx + 1) <= diff_scroll {
-            line_idx += 1;
-        }
-
-        line_idx
-    }
-
-    fn extra_rows_before_line(self, line_idx: usize) -> usize {
-        let editor_rows = if self.editor_anchor.is_some_and(|anchor| anchor < line_idx) {
-            COMMENT_BOX_HEIGHT as usize
-        } else {
-            0
-        };
-        let expanded_rows = if self.expanded_anchor.is_some_and(|anchor| anchor < line_idx) {
-            COMMENT_BOX_HEIGHT as usize
-        } else {
-            0
-        };
-        editor_rows + expanded_rows
-    }
+    highlighted
+        .into_iter()
+        .map(|segment| (wrap::expand_tabs(&segment.text).into_owned(), segment.style))
+        .collect()
 }
 
 fn collapse_removed_lines(lines: &[WholeFileLine]) -> Vec<WholeFileLine> {
@@ -3534,18 +3671,31 @@ fn next_visible_item_area(
     diff_scroll: usize,
     item_height: u16,
 ) -> Option<Rect> {
-    let current_offset = *visual_offset;
-    *visual_offset += item_height as usize;
+    next_visible_line_area(inner, y, visual_offset, diff_scroll, item_height as usize)
+        .map(|(area, _)| area)
+}
 
-    if current_offset + item_height as usize <= diff_scroll || *y >= inner.height {
+/// Like [`next_visible_item_area`], but also returns how many of the item's
+/// rows are scrolled off above the viewport.
+fn next_visible_line_area(
+    inner: Rect,
+    y: &mut u16,
+    visual_offset: &mut usize,
+    diff_scroll: usize,
+    item_height: usize,
+) -> Option<(Rect, usize)> {
+    let current_offset = *visual_offset;
+    *visual_offset += item_height;
+
+    if current_offset + item_height <= diff_scroll || *y >= inner.height {
         return None;
     }
 
     let skip_rows = diff_scroll.saturating_sub(current_offset);
     let available_height = inner.height.saturating_sub(*y);
     let render_height = item_height
-        .saturating_sub(skip_rows as u16)
-        .min(available_height);
+        .saturating_sub(skip_rows)
+        .min(available_height as usize) as u16;
     if render_height == 0 {
         return None;
     }
@@ -3557,7 +3707,7 @@ fn next_visible_item_area(
         height: render_height,
     };
     *y += render_height;
-    Some(row_area)
+    Some((row_area, skip_rows))
 }
 
 fn highlight_line_segments(
@@ -3892,6 +4042,9 @@ mod tests {
             watch_status: WatchStatus::Off,
             last_files_inner_height: 0,
             last_diff_inner_height: 20,
+            last_diff_inner_width: 0,
+            wrap_lines: true,
+            wrap_rows_cache: RefCell::new(None),
             syntax_set: SyntaxSet::load_defaults_nonewlines(),
             syntax_theme: test_theme(),
             palette: &Palette::DARK,
@@ -5009,5 +5162,143 @@ mod tests {
             app.whole_file_highlight_cache.len()
         );
         println!("cache build elapsed: {elapsed:?}");
+    }
+
+    fn wrap_test_app(temp: &TempDirGuard, panel_width: u16) -> App {
+        let mut app = test_app(temp.path.clone(), vec![file_summary("src/demo.rs")]);
+        seed_patch(&mut app);
+        app.last_diff_inner_width = panel_width;
+        app
+    }
+
+    #[test]
+    fn wrapped_layout_rows_match_line_breaking() {
+        let temp = TempDirGuard::new();
+        let app = wrap_test_app(&temp, 24);
+        let layout = app.patch_layout();
+        let lines = app.current_patch().expect("patch").flat_lines.clone();
+
+        let mut expected_start = 0;
+        for (idx, line) in lines.iter().enumerate() {
+            let text_width = 24 - diff_prefix_width(line.old_lineno, line.new_lineno);
+            let height = wrap::row_count(&line.text, text_width);
+            assert_eq!(
+                layout.line_row_start(idx),
+                expected_start,
+                "start of line {idx}"
+            );
+            assert_eq!(layout.line_height(idx), height, "height of line {idx}");
+            expected_start += height;
+        }
+        assert!(
+            (0..lines.len()).any(|idx| layout.line_height(idx) > 1),
+            "fixture should wrap at this width"
+        );
+    }
+
+    #[test]
+    fn wrap_toggle_restores_one_row_per_line() {
+        let temp = TempDirGuard::new();
+        let mut app = wrap_test_app(&temp, 24);
+        assert!(matches!(app.patch_layout().rows, LayoutRows::Wrapped(_)));
+
+        app.on_key(key_char('w')).expect("toggle should succeed");
+        assert!(!app.wrap_lines);
+        let layout = app.patch_layout();
+        assert!(matches!(layout.rows, LayoutRows::Uniform));
+        assert_eq!(layout.line_row_start(3), 3);
+
+        app.on_key(key_char('w')).expect("toggle should succeed");
+        assert!(matches!(app.patch_layout().rows, LayoutRows::Wrapped(_)));
+    }
+
+    #[test]
+    fn wide_panel_keeps_one_row_per_line() {
+        let temp = TempDirGuard::new();
+        let app = wrap_test_app(&temp, 200);
+        let layout = app.patch_layout();
+        for idx in 0..app.current_patch().expect("patch").flat_lines.len() {
+            assert_eq!(layout.line_row_start(idx), idx);
+        }
+    }
+
+    #[test]
+    fn first_visible_line_handles_scroll_inside_wrapped_line() {
+        let layout = DiffLayout {
+            file_comments_height: 0,
+            file_editor: false,
+            editor_anchor: None,
+            expanded_anchor: None,
+            // Line heights 1, 3, 1, 2.
+            rows: LayoutRows::Wrapped(vec![0, 1, 4, 5, 7].into()),
+        };
+        let starts: Vec<usize> = (0..=7)
+            .map(|scroll| layout.first_visible_line(scroll, 4))
+            .collect();
+        assert_eq!(starts, vec![0, 1, 1, 1, 2, 3, 3, 3]);
+        assert_eq!(layout.editor_start(1), 4);
+    }
+
+    #[test]
+    fn cursor_on_wrapped_line_scrolls_its_last_row_into_view() {
+        let temp = TempDirGuard::new();
+        let mut app = wrap_test_app(&temp, 24);
+        app.last_diff_inner_height = 4;
+        let line_count = app.current_patch().expect("patch").flat_lines.len();
+        app.diff_cursor = line_count - 1;
+        app.ensure_cursor_visible();
+
+        let layout = app.patch_layout();
+        let last_row =
+            layout.line_row_start(line_count - 1) + layout.line_height(line_count - 1) - 1;
+        let visible_rows = 3; // ensure_cursor_visible keeps one row of slack
+        assert!(app.diff_scroll <= layout.line_row_start(line_count - 1));
+        assert!(last_row < app.diff_scroll + visible_rows);
+    }
+
+    #[test]
+    fn wrapped_lines_render_continuation_marker() {
+        let temp = TempDirGuard::new();
+        let mut app = wrap_test_app(&temp, 0);
+        let mut terminal =
+            Terminal::new(TestBackend::new(36, 20)).expect("test terminal should initialize");
+        // The diff panel is narrow enough here that `println!("{}", value);` wraps.
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render should succeed");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render should succeed");
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(app.last_diff_inner_width > 0);
+        let layout = app.patch_layout();
+        let wrapped = (0..app.current_patch().expect("patch").flat_lines.len())
+            .any(|idx| layout.line_height(idx) > 1);
+        assert!(
+            wrapped,
+            "panel width {} should wrap a fixture line",
+            app.last_diff_inner_width
+        );
+        assert!(rendered.contains('↪'));
+
+        app.on_key(key_char('w')).expect("toggle should succeed");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render should succeed");
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(!rendered.contains('↪'));
+        assert!(rendered.contains("no wrap"));
     }
 }
