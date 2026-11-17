@@ -4,6 +4,7 @@ mod clipboard;
 mod export;
 mod git;
 mod model;
+mod theme;
 mod updater;
 mod watcher;
 

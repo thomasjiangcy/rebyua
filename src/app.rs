@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::ffi::OsStr;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -30,6 +29,7 @@ use crate::model::{
     Annotation, AnnotationLineRange, ChangeKind, DiffKind, FilePatch, FileSummary, Focus,
     LineReference, PatchLine, ReviewEdge, SelectionRange,
 };
+use crate::theme::{Palette, ThemeMode, detect_theme_mode};
 use crate::watcher::{RepoWatcher, WATCH_POLL_INTERVAL};
 
 const NOTIFICATION_TTL: Duration = Duration::from_secs(3);
@@ -63,6 +63,7 @@ pub fn run(args: ReviewArgs) -> Result<()> {
     } else {
         (None, None)
     };
+    let theme_mode = detect_theme_mode(args.theme_mode);
     let env_theme = std::env::var("REB_THEME").ok();
     let requested_theme = args.theme.as_deref().or(env_theme.as_deref());
     let watch_status = if watcher.is_some() {
@@ -75,6 +76,7 @@ pub fn run(args: ReviewArgs) -> Result<()> {
         files,
         resolved.sequence,
         requested_theme,
+        theme_mode,
         watch_status,
     )?;
     if let Some(error) = watcher_error {
@@ -415,6 +417,7 @@ struct App {
     last_diff_inner_height: u16,
     syntax_set: SyntaxSet,
     syntax_theme: Theme,
+    palette: &'static Palette,
 }
 
 impl App {
@@ -423,11 +426,13 @@ impl App {
         files: Vec<FileSummary>,
         review_sequence: Option<ReviewSequence>,
         requested_theme: Option<&str>,
+        theme_mode: ThemeMode,
         watch_status: WatchStatus,
     ) -> Result<Self> {
         let syntax_set = SyntaxSet::load_defaults_nonewlines();
         let theme_set = ThemeSet::load_defaults();
-        let (_syntax_theme_name, syntax_theme) = resolve_syntax_theme(&theme_set, requested_theme)?;
+        let (_syntax_theme_name, syntax_theme) =
+            resolve_syntax_theme(&theme_set, requested_theme, theme_mode)?;
 
         let mut app = Self {
             repo,
@@ -466,6 +471,7 @@ impl App {
             last_diff_inner_height: 0,
             syntax_set,
             syntax_theme,
+            palette: Palette::for_mode(theme_mode),
         };
         app.refresh_filtered_files();
         if app.filtered_file_indices.is_empty() {
@@ -1554,12 +1560,12 @@ impl App {
         let edge_label = truncate_middle(&title, edge_width);
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled(progress, Style::default().fg(Color::Rgb(160, 196, 255))),
+                Span::styled(progress, Style::default().fg(self.palette.accent)),
                 Span::raw("  "),
                 Span::styled(
                     edge_label,
                     Style::default()
-                        .fg(Color::Rgb(231, 193, 119))
+                        .fg(self.palette.highlight)
                         .add_modifier(Modifier::BOLD),
                 ),
             ])),
@@ -1623,25 +1629,25 @@ impl App {
                     let style = if view_idx == self.selected_file_view_idx {
                         if self.focus == Focus::Files {
                             Style::default()
-                                .fg(Color::Black)
-                                .bg(Color::Rgb(208, 221, 255))
+                                .fg(self.palette.selected_fg)
+                                .bg(self.palette.selected_bg)
                                 .add_modifier(Modifier::BOLD)
                         } else {
                             Style::default()
-                                .fg(Color::Rgb(225, 232, 244))
-                                .bg(Color::Rgb(45, 54, 70))
+                                .fg(self.palette.selected_unfocused_fg)
+                                .bg(self.palette.selected_unfocused_bg)
                         }
                     } else {
                         Style::default()
                     };
                     ListItem::new(Line::from(vec![
-                        Span::styled(comment_marker, Style::default().fg(Color::Yellow)),
+                        Span::styled(comment_marker, Style::default().fg(self.palette.marker)),
                         Span::styled(
                             format!("{badge} "),
-                            Style::default().fg(change_color(&file.change)),
+                            Style::default().fg(change_color(self.palette, &file.change)),
                         ),
                         Span::raw(path),
-                        Span::styled(counts, Style::default().fg(Color::DarkGray)),
+                        Span::styled(counts, Style::default().fg(self.palette.muted)),
                     ]))
                     .style(style)
                 })
@@ -1652,7 +1658,7 @@ impl App {
             Block::default()
                 .title(title)
                 .borders(Borders::ALL)
-                .border_style(panel_border(self.focus == Focus::Files)),
+                .border_style(panel_border(self.palette, self.focus == Focus::Files)),
         );
         frame.render_widget(list, area);
     }
@@ -1672,7 +1678,7 @@ impl App {
         let block = Block::default()
             .title(title)
             .borders(Borders::ALL)
-            .border_style(panel_border(self.focus == Focus::Diff));
+            .border_style(panel_border(self.palette, self.focus == Focus::Diff));
         let inner = block.inner(area);
         frame.render_widget(block, area);
         self.last_diff_inner_height = inner.height;
@@ -1686,7 +1692,7 @@ impl App {
     fn render_patch_view(&mut self, frame: &mut Frame, inner: Rect) {
         let Some(line_count) = self.current_patch().map(|patch| patch.flat_lines.len()) else {
             let empty = Paragraph::new("Select a file to review.")
-                .style(Style::default().fg(Color::DarkGray))
+                .style(Style::default().fg(self.palette.muted))
                 .wrap(Wrap { trim: false });
             frame.render_widget(empty, inner);
             return;
@@ -1711,7 +1717,7 @@ impl App {
             frame.render_widget(
                 Paragraph::new(message)
                     .wrap(Wrap { trim: false })
-                    .style(Style::default().fg(Color::DarkGray)),
+                    .style(Style::default().fg(self.palette.muted)),
                 inner,
             );
             return;
@@ -1787,7 +1793,7 @@ impl App {
             .map(|file| file.visible_lines(self.show_removed_lines).len())
         else {
             let empty = Paragraph::new("Whole-file view is unavailable for this selection.")
-                .style(Style::default().fg(Color::DarkGray))
+                .style(Style::default().fg(self.palette.muted))
                 .wrap(Wrap { trim: false });
             frame.render_widget(empty, inner);
             return;
@@ -1871,11 +1877,11 @@ impl App {
         let has_comments = self.line_has_comments(line_idx);
         let selected = self.focus == Focus::Diff && line_idx == self.diff_cursor;
 
-        let base_style = diff_base_style(line.kind);
+        let base_style = diff_base_style(self.palette, line.kind);
         let line_style = if selected {
-            base_style.bg(diff_cursor_bg())
+            base_style.bg(self.palette.cursor_bg)
         } else if in_selection {
-            base_style.bg(diff_selection_bg())
+            base_style.bg(self.palette.selection_bg)
         } else {
             base_style
         };
@@ -1897,12 +1903,18 @@ impl App {
             .unwrap_or_else(|| "    ".to_string());
 
         let mut spans = vec![
-            Span::styled(format!("{gutter} "), Style::default().fg(Color::Yellow)),
-            Span::styled(old, Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{gutter} "),
+                Style::default().fg(self.palette.marker),
+            ),
+            Span::styled(old, Style::default().fg(self.palette.muted)),
             Span::raw(" "),
-            Span::styled(new, Style::default().fg(Color::DarkGray)),
+            Span::styled(new, Style::default().fg(self.palette.muted)),
             Span::raw(" "),
-            Span::styled(sign, Style::default().fg(diff_sign_color(Some(line.kind)))),
+            Span::styled(
+                sign,
+                Style::default().fg(diff_sign_color(self.palette, Some(line.kind))),
+            ),
             Span::raw(" "),
         ];
 
@@ -1934,14 +1946,14 @@ impl App {
         let selected = self.focus == Focus::Diff && line_idx == self.diff_cursor;
 
         let base_style = if line.collapsed_deletion.is_some() {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(self.palette.muted)
         } else {
-            whole_file_base_style(line.diff_kind)
+            whole_file_base_style(self.palette, line.diff_kind)
         };
         let line_style = if selected {
-            base_style.bg(diff_cursor_bg())
+            base_style.bg(self.palette.cursor_bg)
         } else if in_selection {
-            base_style.bg(diff_selection_bg())
+            base_style.bg(self.palette.selection_bg)
         } else {
             base_style
         };
@@ -1966,12 +1978,18 @@ impl App {
             .unwrap_or_else(|| "    ".to_string());
 
         let mut spans = vec![
-            Span::styled(format!("{gutter} "), Style::default().fg(Color::Yellow)),
-            Span::styled(old, Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{gutter} "),
+                Style::default().fg(self.palette.marker),
+            ),
+            Span::styled(old, Style::default().fg(self.palette.muted)),
             Span::raw(" "),
-            Span::styled(new, Style::default().fg(Color::DarkGray)),
+            Span::styled(new, Style::default().fg(self.palette.muted)),
             Span::raw(" "),
-            Span::styled(sign, Style::default().fg(diff_sign_color(line.diff_kind))),
+            Span::styled(
+                sign,
+                Style::default().fg(diff_sign_color(self.palette, line.diff_kind)),
+            ),
             Span::raw(" "),
         ];
 
@@ -2003,9 +2021,9 @@ impl App {
             (false, false) => " Comment  Enter save  Shift/Alt+Enter newline  Esc cancel ",
         };
         let border_color = if is_file_comment {
-            Color::Rgb(113, 205, 205)
+            self.palette.file_comment_border
         } else {
-            Color::Rgb(216, 180, 84)
+            self.palette.line_comment_border
         };
         draft.editor.set_block(
             Block::default()
@@ -2031,12 +2049,13 @@ impl App {
         let block = Block::default()
             .title(title)
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Rgb(110, 130, 170)));
+            .border_style(Style::default().fg(self.palette.comment_border));
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
         frame.render_widget(
             Paragraph::new(comment_panel_lines(
+                self.palette,
                 comments,
                 selection.map(|selection| selection.selected_idx),
                 selection
@@ -2045,7 +2064,7 @@ impl App {
                 inner.height as usize,
             ))
             .wrap(Wrap { trim: false })
-            .style(Style::default().fg(Color::White)),
+            .style(Style::default().fg(self.palette.text)),
             inner,
         );
     }
@@ -2065,12 +2084,13 @@ impl App {
         let block = Block::default()
             .title(title)
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Rgb(110, 130, 170)));
+            .border_style(Style::default().fg(self.palette.comment_border));
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
         frame.render_widget(
             Paragraph::new(comment_panel_lines(
+                self.palette,
                 comments,
                 selection.map(|selection| selection.selected_idx),
                 selection
@@ -2079,7 +2099,7 @@ impl App {
                 inner.height as usize,
             ))
             .wrap(Wrap { trim: false })
-            .style(Style::default().fg(Color::White)),
+            .style(Style::default().fg(self.palette.text)),
             inner,
         );
     }
@@ -2093,8 +2113,8 @@ impl App {
             .split(area);
         if let Some(notification) = &self.notification {
             let color = match notification.kind {
-                NotificationKind::Success => Color::Rgb(149, 198, 136),
-                NotificationKind::Error => Color::Rgb(224, 110, 110),
+                NotificationKind::Success => self.palette.added,
+                NotificationKind::Error => self.palette.deleted,
             };
             frame.render_widget(
                 Paragraph::new(Line::from(vec![Span::styled(
@@ -2115,7 +2135,7 @@ impl App {
                 .constraints([Constraint::Length(prefix_width), Constraint::Min(0)])
                 .split(chunks[0]);
             frame.render_widget(
-                Paragraph::new(prefix).style(Style::default().fg(Color::Rgb(160, 196, 255))),
+                Paragraph::new(prefix).style(Style::default().fg(self.palette.accent)),
                 prompt_chunks[0],
             );
             frame.render_widget(&prompt.editor, prompt_chunks[1]);
@@ -3442,6 +3462,7 @@ fn comment_panel_title(
 }
 
 fn comment_panel_lines(
+    palette: &Palette,
     comments: Vec<&Annotation>,
     selected_idx: Option<usize>,
     scroll: usize,
@@ -3462,16 +3483,16 @@ fn comment_panel_lines(
             let marker = if selected { "> " } else { "• " };
             let text_style = if selected {
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Rgb(208, 221, 255))
+                    .fg(palette.selected_fg)
+                    .bg(palette.selected_bg)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(palette.text)
             };
             let marker_style = if selected {
                 text_style
             } else {
-                Style::default().fg(Color::Yellow)
+                Style::default().fg(palette.marker)
             };
             Line::from(vec![
                 Span::styled(marker, marker_style),
@@ -3550,7 +3571,7 @@ fn highlight_line_segments(
     if highlighted.is_empty() {
         return vec![StyledSegment {
             text: text.to_string(),
-            style: Style::default().fg(Color::White),
+            style: Style::default(),
         }];
     }
 
@@ -3589,6 +3610,7 @@ fn cache_line_highlights(
 fn resolve_syntax_theme(
     theme_set: &ThemeSet,
     requested_theme: Option<&str>,
+    theme_mode: ThemeMode,
 ) -> Result<(String, Theme)> {
     if let Some(theme_name) = requested_theme {
         let theme = theme_set.themes.get(theme_name).cloned().with_context(|| {
@@ -3598,7 +3620,7 @@ fn resolve_syntax_theme(
         return Ok((theme_name.to_string(), theme));
     }
 
-    for &theme_name in adaptive_default_theme_candidates() {
+    for &theme_name in default_theme_candidates_for_mode(theme_mode) {
         if let Some(theme) = theme_set.themes.get(theme_name).cloned() {
             return Ok((theme_name.to_string(), theme));
         }
@@ -3613,62 +3635,11 @@ fn resolve_syntax_theme(
     Ok((theme_name, theme))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TerminalThemeMode {
-    Light,
-    Dark,
-}
-
-fn adaptive_default_theme_candidates() -> &'static [&'static str] {
-    default_theme_candidates_for_mode(detect_terminal_theme_mode())
-}
-
-fn default_theme_candidates_for_mode(mode: TerminalThemeMode) -> &'static [&'static str] {
+fn default_theme_candidates_for_mode(mode: ThemeMode) -> &'static [&'static str] {
     match mode {
-        TerminalThemeMode::Light => &DEFAULT_LIGHT_THEME_CANDIDATES,
-        TerminalThemeMode::Dark => &DEFAULT_DARK_THEME_CANDIDATES,
+        ThemeMode::Light => &DEFAULT_LIGHT_THEME_CANDIDATES,
+        ThemeMode::Dark => &DEFAULT_DARK_THEME_CANDIDATES,
     }
-}
-
-fn detect_terminal_theme_mode() -> TerminalThemeMode {
-    detect_terminal_theme_mode_with_env(
-        std::env::var_os("REB_THEME_MODE"),
-        std::env::var_os("COLORFGBG"),
-    )
-}
-
-fn detect_terminal_theme_mode_with_env(
-    mode_override: Option<std::ffi::OsString>,
-    colorfgbg: Option<std::ffi::OsString>,
-) -> TerminalThemeMode {
-    if let Some(mode) = mode_override.as_deref().and_then(parse_theme_mode_override) {
-        return mode;
-    }
-
-    if let Some(mode) = colorfgbg.as_deref().and_then(parse_colorfgbg_theme_mode) {
-        return mode;
-    }
-
-    TerminalThemeMode::Dark
-}
-
-fn parse_theme_mode_override(value: &OsStr) -> Option<TerminalThemeMode> {
-    match value.to_string_lossy().trim().to_ascii_lowercase().as_str() {
-        "light" => Some(TerminalThemeMode::Light),
-        "dark" => Some(TerminalThemeMode::Dark),
-        _ => None,
-    }
-}
-
-fn parse_colorfgbg_theme_mode(value: &OsStr) -> Option<TerminalThemeMode> {
-    let value = value.to_string_lossy();
-    let last = value.rsplit(';').next()?.trim();
-    let bg_index: u8 = last.parse().ok()?;
-    Some(if bg_index <= 6 || bg_index == 8 {
-        TerminalThemeMode::Dark
-    } else {
-        TerminalThemeMode::Light
-    })
 }
 
 fn available_theme_names(theme_set: &ThemeSet) -> Vec<String> {
@@ -3707,61 +3678,53 @@ fn change_badge(change: &ChangeKind) -> &'static str {
     }
 }
 
-fn change_color(change: &ChangeKind) -> Color {
+fn change_color(palette: &Palette, change: &ChangeKind) -> Color {
     match change {
-        ChangeKind::Added => Color::Rgb(149, 198, 136),
-        ChangeKind::Modified => Color::Rgb(160, 196, 255),
-        ChangeKind::Deleted => Color::Rgb(224, 110, 110),
-        ChangeKind::Renamed => Color::Rgb(231, 193, 119),
-        ChangeKind::TypeChange => Color::Rgb(214, 180, 255),
-        ChangeKind::Copied => Color::Rgb(113, 205, 205),
-        ChangeKind::Unknown(_) => Color::Gray,
+        ChangeKind::Added => palette.added,
+        ChangeKind::Modified => palette.modified,
+        ChangeKind::Deleted => palette.deleted,
+        ChangeKind::Renamed => palette.renamed,
+        ChangeKind::TypeChange => palette.type_changed,
+        ChangeKind::Copied => palette.copied,
+        ChangeKind::Unknown(_) => palette.unknown,
     }
 }
 
-fn diff_sign_color(kind: Option<DiffKind>) -> Color {
+fn diff_sign_color(palette: &Palette, kind: Option<DiffKind>) -> Color {
     match kind {
-        Some(DiffKind::Add) => Color::Rgb(149, 198, 136),
-        Some(DiffKind::Delete) => Color::Rgb(224, 110, 110),
-        Some(DiffKind::Context) => Color::Rgb(133, 146, 178),
-        None => Color::DarkGray,
+        Some(DiffKind::Add) => palette.added,
+        Some(DiffKind::Delete) => palette.deleted,
+        Some(DiffKind::Context) => palette.context_sign,
+        None => palette.muted,
     }
 }
 
-fn diff_base_style(kind: DiffKind) -> Style {
+fn diff_base_style(palette: &Palette, kind: DiffKind) -> Style {
     match kind {
-        DiffKind::Add => Style::default().bg(Color::Rgb(33, 58, 43)),
-        DiffKind::Delete => Style::default().bg(Color::Rgb(74, 34, 29)),
+        DiffKind::Add => Style::default().bg(palette.add_bg),
+        DiffKind::Delete => Style::default().bg(palette.delete_bg),
         DiffKind::Context => Style::default(),
     }
 }
 
-fn whole_file_base_style(kind: Option<DiffKind>) -> Style {
+fn whole_file_base_style(palette: &Palette, kind: Option<DiffKind>) -> Style {
     match kind {
-        Some(kind) => diff_base_style(kind),
+        Some(kind) => diff_base_style(palette, kind),
         None => Style::default(),
     }
 }
 
-fn diff_selection_bg() -> Color {
-    Color::Rgb(37, 51, 68)
-}
-
-fn diff_cursor_bg() -> Color {
-    Color::Rgb(52, 70, 91)
-}
-
-fn panel_border(active: bool) -> Style {
+fn panel_border(palette: &Palette, active: bool) -> Style {
     if active {
-        Style::default().fg(Color::Rgb(160, 196, 255))
+        Style::default().fg(palette.accent)
     } else {
-        Style::default().fg(Color::Rgb(70, 74, 90))
+        Style::default().fg(palette.border_inactive)
     }
 }
 
 fn build_prompt_editor(initial: &str) -> TextArea<'static> {
     let mut editor = TextArea::new(vec![initial.replace(['\n', '\r'], " ")]);
-    editor.set_style(Style::default().fg(Color::White));
+    editor.set_style(Style::default());
     editor.set_cursor_line_style(Style::default());
     editor.set_tab_length(0);
     editor.move_cursor(CursorMove::End);
@@ -3778,7 +3741,7 @@ fn build_comment_editor(initial: &str) -> TextArea<'static> {
     }
 
     let mut editor = TextArea::new(lines);
-    editor.set_style(Style::default().fg(Color::White));
+    editor.set_style(Style::default());
     editor.set_cursor_line_style(Style::default());
     editor.set_tab_length(2);
     editor.set_wrap_mode(WrapMode::WordOrGlyph);
@@ -3831,7 +3794,7 @@ mod tests {
 
     fn test_theme() -> Theme {
         let theme_set = ThemeSet::load_defaults();
-        resolve_syntax_theme(&theme_set, None)
+        resolve_syntax_theme(&theme_set, None, ThemeMode::Dark)
             .expect("default test theme should resolve")
             .1
     }
@@ -3931,6 +3894,7 @@ mod tests {
             last_diff_inner_height: 20,
             syntax_set: SyntaxSet::load_defaults_nonewlines(),
             syntax_theme: test_theme(),
+            palette: &Palette::DARK,
         }
     }
 
@@ -4664,7 +4628,7 @@ mod tests {
     fn resolves_requested_theme_by_name() {
         let theme_set = ThemeSet::load_defaults();
 
-        let (name, _) = resolve_syntax_theme(&theme_set, Some("InspiredGitHub"))
+        let (name, _) = resolve_syntax_theme(&theme_set, Some("InspiredGitHub"), ThemeMode::Dark)
             .expect("requested theme should resolve");
 
         assert_eq!(name, "InspiredGitHub");
@@ -4674,7 +4638,7 @@ mod tests {
     fn reports_available_themes_for_unknown_name() {
         let theme_set = ThemeSet::load_defaults();
 
-        let err = resolve_syntax_theme(&theme_set, Some("not-a-real-theme"))
+        let err = resolve_syntax_theme(&theme_set, Some("not-a-real-theme"), ThemeMode::Dark)
             .expect_err("unknown theme should fail");
         let message = format!("{err:#}");
 
@@ -4714,8 +4678,15 @@ mod tests {
 
         let repo = GitRepo::for_worktree(temp.path.clone(), "HEAD".to_string(), false, Vec::new());
         let files = repo.load_files().expect("changed files should load");
-        let mut app =
-            App::new(repo, files, None, None, WatchStatus::Active).expect("app should initialize");
+        let mut app = App::new(
+            repo,
+            files,
+            None,
+            None,
+            ThemeMode::Dark,
+            WatchStatus::Active,
+        )
+        .expect("app should initialize");
         let selected_line = app
             .current_whole_file()
             .expect("whole-file view should load")
@@ -4742,41 +4713,13 @@ mod tests {
     }
 
     #[test]
-    fn detects_dark_theme_mode_by_default() {
-        assert_eq!(
-            detect_terminal_theme_mode_with_env(None, None),
-            TerminalThemeMode::Dark
-        );
-    }
-
-    #[test]
-    fn detects_light_theme_mode_from_override() {
-        assert_eq!(
-            detect_terminal_theme_mode_with_env(Some("light".into()), None),
-            TerminalThemeMode::Light
-        );
-    }
-
-    #[test]
-    fn detects_light_theme_mode_from_colorfgbg() {
-        assert_eq!(
-            detect_terminal_theme_mode_with_env(None, Some("15;0".into())),
-            TerminalThemeMode::Dark
-        );
-        assert_eq!(
-            detect_terminal_theme_mode_with_env(None, Some("0;15".into())),
-            TerminalThemeMode::Light
-        );
-    }
-
-    #[test]
     fn light_mode_uses_light_candidate_list() {
         assert_eq!(
-            default_theme_candidates_for_mode(TerminalThemeMode::Light),
+            default_theme_candidates_for_mode(ThemeMode::Light),
             &DEFAULT_LIGHT_THEME_CANDIDATES
         );
         assert_eq!(
-            default_theme_candidates_for_mode(TerminalThemeMode::Dark),
+            default_theme_candidates_for_mode(ThemeMode::Dark),
             &DEFAULT_DARK_THEME_CANDIDATES
         );
     }
