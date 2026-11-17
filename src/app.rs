@@ -8,10 +8,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
-use crossterm::execute;
 use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode,
 };
+use crossterm::{execute, queue};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -91,10 +92,7 @@ pub fn run(args: ReviewArgs) -> Result<()> {
 
     while !app.should_quit {
         if needs_redraw {
-            terminal
-                .terminal
-                .draw(|frame| app.render(frame))
-                .context("failed to draw terminal frame")?;
+            draw_synchronized(&mut terminal.terminal, |frame| app.render(frame))?;
             needs_redraw = false;
         }
 
@@ -104,14 +102,9 @@ pub fn run(args: ReviewArgs) -> Result<()> {
             app.notification_poll_timeout()
         };
         if event::poll(poll_timeout).context("failed to poll terminal events")? {
-            match event::read().context("failed to read terminal event")? {
-                Event::Key(key) if key.kind == event::KeyEventKind::Press => {
-                    app.on_key(key)?;
-                    needs_redraw = true;
-                }
-                Event::Resize(_, _) => needs_redraw = true,
-                _ => {}
-            }
+            let first = event::read().context("failed to read terminal event")?;
+            needs_redraw |=
+                handle_input_batch(&mut app, first, read_ready_event, INPUT_BATCH_BUDGET)?;
         }
 
         if app.expire_notification() {
@@ -158,6 +151,76 @@ pub fn run(args: ReviewArgs) -> Result<()> {
     Ok(())
 }
 
+/// Limits on how much queued input is handled before drawing again, so a large
+/// paste or a flood of events can't keep the screen from updating.
+const INPUT_BATCH_MAX_EVENTS: usize = 256;
+const INPUT_BATCH_BUDGET: Duration = Duration::from_millis(16);
+
+/// Handles one terminal event and reports whether the screen needs redrawing.
+fn handle_terminal_event(app: &mut App, terminal_event: Event) -> Result<bool> {
+    match terminal_event {
+        Event::Key(key) if key.kind == event::KeyEventKind::Press => {
+            app.on_key(key)?;
+            Ok(true)
+        }
+        Event::Resize(_, _) => Ok(true),
+        _ => Ok(false),
+    }
+}
+
+/// Returns the next terminal event only if one is already waiting.
+fn read_ready_event() -> Result<Option<Event>> {
+    if event::poll(Duration::ZERO).context("failed to poll terminal events")? {
+        Ok(Some(
+            event::read().context("failed to read terminal event")?,
+        ))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Handles `first` and every event already queued behind it, so the caller
+/// draws once per batch instead of once per keypress. Events are handled in
+/// order and none are dropped; the batch ends early when the app quits or the
+/// event/time limits are reached, leaving the rest queued for the next batch.
+fn handle_input_batch(
+    app: &mut App,
+    first: Event,
+    mut next_ready: impl FnMut() -> Result<Option<Event>>,
+    budget: Duration,
+) -> Result<bool> {
+    let deadline = Instant::now() + budget;
+    let mut needs_redraw = handle_terminal_event(app, first)?;
+    let mut handled = 1;
+    while !app.should_quit && handled < INPUT_BATCH_MAX_EVENTS && Instant::now() < deadline {
+        let Some(next) = next_ready()? else {
+            break;
+        };
+        needs_redraw |= handle_terminal_event(app, next)?;
+        handled += 1;
+    }
+    Ok(needs_redraw)
+}
+
+/// Draws one frame inside a synchronized-output block (DEC mode 2026), so
+/// terminals that support it show the frame all at once instead of
+/// mid-update. Other terminals ignore the markers. The end marker is sent even
+/// when drawing fails, so the terminal is never left holding back updates.
+fn draw_synchronized<W: std::io::Write>(
+    terminal: &mut Terminal<CrosstermBackend<W>>,
+    render: impl FnOnce(&mut Frame),
+) -> Result<()> {
+    queue!(terminal.backend_mut(), BeginSynchronizedUpdate)
+        .context("failed to begin synchronized update")?;
+    let drawn = terminal
+        .draw(render)
+        .map(|_| ())
+        .context("failed to draw terminal frame");
+    let ended = execute!(terminal.backend_mut(), EndSynchronizedUpdate)
+        .context("failed to end synchronized update");
+    drawn.and(ended)
+}
+
 struct TerminalSession {
     terminal: Terminal<CrosstermBackend<std::io::Stdout>>,
 }
@@ -175,6 +238,7 @@ impl TerminalSession {
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
+        let _ = execute!(self.terminal.backend_mut(), EndSynchronizedUpdate);
         let _ = disable_raw_mode();
         let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
         let _ = self.terminal.show_cursor();
@@ -5300,5 +5364,212 @@ mod tests {
             .collect();
         assert!(!rendered.contains('↪'));
         assert!(rendered.contains("no wrap"));
+    }
+
+    fn queued(events: Vec<Event>) -> std::collections::VecDeque<Event> {
+        events.into_iter().collect()
+    }
+
+    fn press(ch: char) -> Event {
+        Event::Key(key_char(ch))
+    }
+
+    #[test]
+    fn input_batch_handles_all_queued_keys_in_order() {
+        let temp = TempDirGuard::new();
+        let mut app = test_app(temp.path.clone(), vec![file_summary("src/demo.rs")]);
+        seed_patch(&mut app);
+        app.diff_cursor = 0;
+        let mut queue = queued(vec![press('j'), press('j'), press('k'), press('j')]);
+
+        let redraw = handle_input_batch(
+            &mut app,
+            press('j'),
+            || Ok(queue.pop_front()),
+            Duration::from_secs(5),
+        )
+        .expect("batch should succeed");
+
+        assert!(redraw);
+        assert_eq!(app.diff_cursor, 3);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn input_batch_stops_after_quit() {
+        let temp = TempDirGuard::new();
+        let mut app = test_app(temp.path.clone(), vec![file_summary("src/demo.rs")]);
+        seed_patch(&mut app);
+        let mut queue = queued(vec![press('j'), press('j')]);
+
+        handle_input_batch(
+            &mut app,
+            press('q'),
+            || Ok(queue.pop_front()),
+            Duration::from_secs(5),
+        )
+        .expect("batch should succeed");
+
+        assert!(app.should_quit);
+        assert_eq!(queue.len(), 2, "keys after quit stay unhandled");
+    }
+
+    #[test]
+    fn input_batch_respects_event_limit() {
+        let temp = TempDirGuard::new();
+        let mut app = test_app(temp.path.clone(), vec![file_summary("src/demo.rs")]);
+        seed_patch(&mut app);
+        let mut queue = queued((0..1000).map(|_| press('j')).collect());
+
+        handle_input_batch(
+            &mut app,
+            press('j'),
+            || Ok(queue.pop_front()),
+            Duration::from_secs(5),
+        )
+        .expect("batch should succeed");
+
+        assert_eq!(queue.len(), 1001 - INPUT_BATCH_MAX_EVENTS);
+    }
+
+    #[test]
+    fn input_batch_respects_time_budget() {
+        let temp = TempDirGuard::new();
+        let mut app = test_app(temp.path.clone(), vec![file_summary("src/demo.rs")]);
+        seed_patch(&mut app);
+        let mut queue = queued(vec![press('j'), press('j')]);
+
+        handle_input_batch(
+            &mut app,
+            press('j'),
+            || Ok(queue.pop_front()),
+            Duration::ZERO,
+        )
+        .expect("batch should succeed");
+
+        assert_eq!(
+            app.diff_cursor, 1,
+            "only the first event fits a zero budget"
+        );
+        assert_eq!(queue.len(), 2);
+    }
+
+    #[test]
+    fn input_batch_redraws_only_for_keys_and_resizes() {
+        let temp = TempDirGuard::new();
+        let mut app = test_app(temp.path.clone(), vec![file_summary("src/demo.rs")]);
+        seed_patch(&mut app);
+        let release = Event::Key(KeyEvent::new_with_kind(
+            KeyCode::Char('j'),
+            KeyModifiers::NONE,
+            event::KeyEventKind::Release,
+        ));
+
+        let redraw = handle_input_batch(
+            &mut app,
+            Event::FocusGained,
+            || Ok(None),
+            Duration::from_secs(5),
+        )
+        .expect("batch should succeed");
+        assert!(!redraw);
+
+        let mut queue = queued(vec![release]);
+        let redraw = handle_input_batch(
+            &mut app,
+            Event::FocusLost,
+            || Ok(queue.pop_front()),
+            Duration::from_secs(5),
+        )
+        .expect("batch should succeed");
+        assert!(!redraw);
+        assert_eq!(app.diff_cursor, 0, "key releases are ignored");
+
+        let redraw = handle_input_batch(
+            &mut app,
+            Event::Resize(80, 24),
+            || Ok(None),
+            Duration::from_secs(5),
+        )
+        .expect("batch should succeed");
+        assert!(redraw);
+    }
+
+    const SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
+    const SYNC_END: &[u8] = b"\x1b[?2026l";
+
+    /// Records output; optionally rejects everything except the sync markers.
+    struct RecordingWriter {
+        output: std::rc::Rc<RefCell<Vec<u8>>>,
+        fail_frame_writes: bool,
+    }
+
+    impl std::io::Write for RecordingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.fail_frame_writes && buf != SYNC_BEGIN && buf != SYNC_END {
+                return Err(std::io::Error::other("terminal went away"));
+            }
+            self.output.borrow_mut().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn recording_terminal(
+        fail_frame_writes: bool,
+    ) -> (
+        Terminal<CrosstermBackend<RecordingWriter>>,
+        std::rc::Rc<RefCell<Vec<u8>>>,
+    ) {
+        let output = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let backend = CrosstermBackend::new(RecordingWriter {
+            output: std::rc::Rc::clone(&output),
+            fail_frame_writes,
+        });
+        let terminal = Terminal::with_options(
+            backend,
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 20, 2)),
+            },
+        )
+        .expect("terminal should initialize");
+        (terminal, output)
+    }
+
+    #[test]
+    fn frames_are_wrapped_in_synchronized_update() {
+        let (mut terminal, output) = recording_terminal(false);
+        for text in ["first frame", "second frame"] {
+            output.borrow_mut().clear();
+            draw_synchronized(&mut terminal, |frame| {
+                frame.render_widget(Paragraph::new(text), frame.area());
+            })
+            .expect("draw should succeed");
+
+            let bytes = output.borrow();
+            assert!(bytes.starts_with(SYNC_BEGIN));
+            assert!(bytes.ends_with(SYNC_END));
+            assert!(
+                bytes.len() > SYNC_BEGIN.len() + SYNC_END.len(),
+                "frame content is drawn"
+            );
+        }
+    }
+
+    #[test]
+    fn synchronized_update_is_ended_when_drawing_fails() {
+        let (mut terminal, output) = recording_terminal(true);
+        let result = draw_synchronized(&mut terminal, |frame| {
+            frame.render_widget(Paragraph::new("never shown"), frame.area());
+        });
+
+        assert!(result.is_err());
+        assert_eq!(
+            output.borrow().as_slice(),
+            [SYNC_BEGIN, SYNC_END].concat().as_slice()
+        );
     }
 }
