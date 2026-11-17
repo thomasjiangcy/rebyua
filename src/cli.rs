@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use crate::app;
+use crate::theme::ThemeMode;
 use crate::updater;
 
 #[derive(Parser, Debug)]
@@ -51,6 +52,13 @@ pub struct ReviewArgs {
         help = "Syntax highlighting theme name (or set REB_THEME)"
     )]
     pub theme: Option<String>,
+    #[arg(
+        long,
+        value_enum,
+        value_name = "MODE",
+        help = "Force light or dark colors instead of detecting the terminal background (or set REB_THEME_MODE)"
+    )]
+    pub theme_mode: Option<ThemeMode>,
     #[arg(long)]
     pub path: Vec<String>,
     #[arg(long)]
@@ -66,6 +74,7 @@ impl Default for ReviewArgs {
             stack: None,
             commits: None,
             theme: None,
+            theme_mode: None,
             path: Vec::new(),
             staged: false,
             no_watch: false,
@@ -114,6 +123,7 @@ mod tests {
         assert_eq!(args.stack, None);
         assert_eq!(args.commits, None);
         assert_eq!(args.theme, None);
+        assert_eq!(args.theme_mode, None);
         assert!(args.path.is_empty());
         assert!(!args.staged);
         assert!(!cli.no_watch);
@@ -128,6 +138,8 @@ mod tests {
             "HEAD~2",
             "--theme",
             "InspiredGitHub",
+            "--theme-mode",
+            "light",
             "--path",
             "src/app.rs",
             "--path",
@@ -144,6 +156,7 @@ mod tests {
         assert_eq!(args.stack, None);
         assert_eq!(args.commits, None);
         assert_eq!(args.theme.as_deref(), Some("InspiredGitHub"));
+        assert_eq!(args.theme_mode, Some(ThemeMode::Light));
         assert_eq!(args.path, vec!["src/app.rs", "src/cli.rs"]);
         assert!(args.staged);
     }
