@@ -7,6 +7,7 @@ mod model;
 mod theme;
 mod updater;
 mod watcher;
+mod wrap;
 
 fn main() {
     if let Err(err) = cli::run() {

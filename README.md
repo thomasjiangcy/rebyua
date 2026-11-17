@@ -99,6 +99,7 @@ This checks the latest GitHub release for the current platform and replaces the 
 - `gg` / `G`: jump to top or bottom
 - `J` / `K`: jump between hunks
 - `r`: reveal or collapse removed lines in the current-file view
+- `w`: toggle soft-wrapping of long lines (on by default)
 - `R`: refresh the review immediately
 - `t`: toggle between current-file and traditional patch views
 - `v`: start or lock a line-range selection

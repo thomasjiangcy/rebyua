@@ -1974,6 +1974,7 @@ dependencies = [
  "tar",
  "tempfile",
  "terminal-colorsaurus",
+ "unicode-width",
 ]
 
 [[package]]
